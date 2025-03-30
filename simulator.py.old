@@ -1,0 +1,368 @@
+import numpy as np
+from collections import defaultdict
+import math
+
+
+class MemorySystem:
+    def __init__(self, config):
+        self.storage = defaultdict(np.ndarray)
+        self.kv_cache = defaultdict(list)
+        self.read_latency = config['mem_read_latency']
+        self.write_latency = config['mem_write_latency']
+        self.total_cycles = 0
+        self.access_count = 0
+
+    def read(self, key):
+        self.total_cycles += self.read_latency
+        self.access_count += 1
+        return self.storage[key].copy()
+
+    def write(self, key, data):
+        self.total_cycles += self.write_latency
+        self.access_count += 1
+        self.storage[key] = data.copy()
+
+    def update_kv_cache(self, layer_idx, k, v):
+        cache_key_k = f"layer{layer_idx}_k"
+        cache_key_v = f"layer{layer_idx}_v"
+
+        if cache_key_k not in self.storage:
+            self.storage[cache_key_k] = k
+            self.storage[cache_key_v] = v
+        else:
+            self.storage[cache_key_k] = np.concatenate(
+                [self.storage[cache_key_k], k], axis=2)
+            self.storage[cache_key_v] = np.concatenate(
+                [self.storage[cache_key_v], v], axis=2)
+
+        self.total_cycles += self.write_latency * 2
+
+
+class ComputeUnit:
+    def __init__(self, config, unit_type):
+        self.dsp = config[f'dsp_{unit_type}']
+        self.cycle_per_op = config[f'cycle_{unit_type}']
+        self.bit_width = config.get('bit_width', 32)
+        self.ops_per_cycle = max(1, self.dsp // (32 // self.bit_width))
+
+    def calc_cycles(self, operations):
+        return math.ceil(operations / self.ops_per_cycle) * self.cycle_per_op
+
+
+class MatMulUnit:
+    def __init__(self, config):
+        self.unit = ComputeUnit(config, 'matmul')
+        self.memory = None
+
+    def set_memory(self, memory):
+        self.memory = memory
+
+    def __call__(self, a_key, b_key, out_key, transpose_b=False):
+        a = self.memory.read(a_key)
+        b = self.memory.read(b_key)
+
+        if transpose_b:
+            b = b.T
+
+        m, k = a.shape
+        k_, n = b.shape
+        assert k == k_, "Matrix dimensions mismatch"
+
+        # 分块矩阵乘法
+        block_size = int(math.sqrt(self.unit.ops_per_cycle))
+        c = np.zeros((m, n))
+
+        total_ops = 2 * m * n * k
+        cycles = self.unit.calc_cycles(total_ops)
+
+        for i in range(0, m, block_size):
+            for j in range(0, n, block_size):
+                for k_block in range(0, k, block_size):
+                    i_end = min(i+block_size, m)
+                    j_end = min(j+block_size, n)
+                    k_end = min(k_block+block_size, k)
+
+                    a_block = a[i:i_end, k_block:k_end]
+                    b_block = b[k_block:k_end, j:j_end]
+                    c[i:i_end, j:j_end] += np.dot(a_block, b_block)
+
+        self.memory.write(out_key, c)
+        return cycles
+
+
+class AttentionUnit:
+    def __init__(self, config, layer_idx):
+        self.config = config
+        self.layer_idx = layer_idx
+        self.n_heads = config['n_heads']
+        self.d_model = config['d_model']
+        self.d_head = self.d_model // self.n_heads
+
+        self.q_matmul = MatMulUnit(config)
+        self.k_matmul = MatMulUnit(config)
+        self.v_matmul = MatMulUnit(config)
+        self.out_matmul = MatMulUnit(config)
+        self.softmax = ComputeUnit(config, 'softmax')
+        self.add = ComputeUnit(config, 'add')
+        self.memory = None
+
+    def set_memory(self, memory):
+        self.memory = memory
+        self.q_matmul.set_memory(memory)
+        self.k_matmul.set_memory(memory)
+        self.v_matmul.set_memory(memory)
+        self.out_matmul.set_memory(memory)
+
+    def split_heads(self, x_key, out_key):
+        x = self.memory.read(x_key)
+        batch_size, seq_len, _ = x.shape
+        x = x.reshape(batch_size, seq_len, self.n_heads, self.d_head)
+        x = x.transpose(0, 2, 1, 3)  # [batch, head, seq, d_head]
+        self.memory.write(out_key, x)
+        return self.add.calc_cycles(x.size * 2)
+
+    def scaled_dot_product_attention(self, q_key, k_key, v_key, out_key):
+        q = self.memory.read(q_key)
+        k = self.memory.read(k_key)
+        v = self.memory.read(v_key)
+
+        # QK^T
+        matmul_cycles = self.q_matmul(
+            q_key, k_key, 'attention_scores', transpose_b=True)
+        scores = self.memory.read('attention_scores') / math.sqrt(self.d_head)
+
+        # Softmax
+        softmax_cycles = self.softmax.calc_cycles(scores.size * 4)
+        attention = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
+        attention /= np.sum(attention, axis=-1, keepdims=True)
+        self.memory.write('attention_probs', attention)
+
+        # 输出投影
+        out_cycles = self.out_matmul('attention_probs', v_key, out_key)
+
+        # 更新KV缓存
+        self.memory.update_kv_cache(self.layer_idx, k, v)
+
+        return matmul_cycles + softmax_cycles + out_cycles
+
+    def __call__(self, input_key, out_key):
+        total_cycles = 0
+
+        # 计算Q/K/V
+        q_key = f"layer{self.layer_idx}_q"
+        k_key = f"layer{self.layer_idx}_k"
+        v_key = f"layer{self.layer_idx}_v"
+
+        total_cycles += self.q_matmul(input_key, f"wq_{self.layer_idx}", q_key)
+        total_cycles += self.k_matmul(input_key, f"wk_{self.layer_idx}", k_key)
+        total_cycles += self.v_matmul(input_key, f"wv_{self.layer_idx}", v_key)
+
+        # 分割多头
+        total_cycles += self.split_heads(q_key, q_key)
+        total_cycles += self.split_heads(k_key, k_key)
+        total_cycles += self.split_heads(v_key, v_key)
+
+        # 注意力计算
+        total_cycles += self.scaled_dot_product_attention(
+            q_key, k_key, v_key, out_key)
+
+        # 合并多头
+        output = self.memory.read(out_key)
+        output = output.transpose(0, 2, 1, 3).reshape(
+            output.shape[0], output.shape[2], -1)
+        self.memory.write(out_key, output)
+        total_cycles += self.add.calc_cycles(output.size * 2)
+
+        return total_cycles
+
+
+class FeedForwardNetwork:
+    def __init__(self, config, layer_idx):
+        self.config = config
+        self.layer_idx = layer_idx
+        self.linear1 = MatMulUnit(config)
+        self.linear2 = MatMulUnit(config)
+        self.gelu = ComputeUnit(config, 'gelu')
+        self.memory = None
+
+    def set_memory(self, memory):
+        self.memory = memory
+        self.linear1.set_memory(memory)
+        self.linear2.set_memory(memory)
+
+    def gelu_activation(self, x_key, out_key):
+        x = self.memory.read(x_key)
+        ops = x.size * 8  # 近似操作数
+        cycles = self.gelu.calc_cycles(ops)
+
+        output = 0.5 * x * (1 + np.tanh(math.sqrt(2 / math.pi)
+                            * (x + 0.044715 * np.power(x, 3))))
+        self.memory.write(out_key, output)
+        return cycles
+
+    def __call__(self, input_key, out_key):
+        total_cycles = 0
+
+        intermediate_key = f"layer{self.layer_idx}_ffn_intermediate"
+        total_cycles += self.linear1(input_key,
+                                     f"w1_{self.layer_idx}", intermediate_key)
+        total_cycles += self.gelu_activation(intermediate_key,
+                                             intermediate_key)
+        total_cycles += self.linear2(intermediate_key,
+                                     f"w2_{self.layer_idx}", out_key)
+
+        return total_cycles
+
+
+class LayerNorm:
+    def __init__(self, config):
+        self.norm = ComputeUnit(config, 'layernorm')
+        self.add = ComputeUnit(config, 'add')
+        self.memory = None
+
+    def set_memory(self, memory):
+        self.memory = memory
+
+    def __call__(self, input_key, gamma_key, beta_key, out_key):
+        x = self.memory.read(input_key)
+        gamma = self.memory.read(gamma_key)
+        beta = self.memory.read(beta_key)
+
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.var(x, axis=-1, keepdims=True)
+        x_norm = (x - mean) / np.sqrt(var + 1e-5)
+        output = x_norm * gamma + beta
+
+        self.memory.write(out_key, output)
+        return self.norm.calc_cycles(x.size * 4)
+
+
+class TransformerBlock:
+    def __init__(self, config, layer_idx):
+        self.layer_idx = layer_idx
+        self.attention = AttentionUnit(config, layer_idx)
+        self.ffn = FeedForwardNetwork(config, layer_idx)
+        self.ln1 = LayerNorm(config)
+        self.ln2 = LayerNorm(config)
+        self.add = ComputeUnit(config, 'add')
+        self.memory = None
+
+    def set_memory(self, memory):
+        self.memory = memory
+        self.attention.set_memory(memory)
+        self.ffn.set_memory(memory)
+        self.ln1.set_memory(memory)
+        self.ln2.set_memory(memory)
+
+    def __call__(self, input_key):
+        total_cycles = 0
+
+        # 自注意力
+        attn_out_key = f"layer{self.layer_idx}_attn_out"
+        total_cycles += self.attention(input_key, attn_out_key)
+
+        # 残差连接
+        residual_key = f"layer{self.layer_idx}_residual"
+        self.memory.write(residual_key, self.memory.read(input_key)  # 需要实际实现加法
+
+        # LayerNorm
+        ln1_out_key=f"layer{self.layer_idx}_ln1_out"
+        total_cycles += self.ln1(residual_key, f"ln1_gamma_{self.layer_idx}",
+                               f"ln1_beta_{self.layer_idx}", ln1_out_key)
+
+        # FFN
+        ffn_out_key=f"layer{self.layer_idx}_ffn_out"
+        total_cycles += self.ffn(ln1_out_key, ffn_out_key)
+
+        # 残差连接和LayerNorm
+        final_residual_key=f"layer{self.layer_idx}_final_residual"
+        self.memory.write(final_residual_key,
+                          self.memory.read(ln1_out_key))  # 需要实际实现加法
+
+        output_key=f"layer{self.layer_idx}_output"
+        total_cycles += self.ln2(final_residual_key, f"ln2_gamma_{self.layer_idx}",
+                               f"ln2_beta_{self.layer_idx}", output_key)
+
+        return total_cycles
+
+class GPT2Simulator:
+    def __init__(self, config):
+        self.config=config
+        self.memory=MemorySystem(config)
+
+        # 初始化所有组件
+        self.transformer_layers=[
+            self._create_layer(i) for i in range(config['n_layers'])
+        ]
+
+        # 初始化权重
+        self._initialize_weights()
+
+    def _create_layer(self, layer_idx):
+        layer=TransformerBlock(self.config, layer_idx)
+        layer.set_memory(self.memory)
+        return layer
+
+    def _initialize_weights(self):
+        d_model=self.config['d_model']
+        for i in range(self.config['n_layers']):
+            # 注意力权重
+            self.memory.write(f"wq_{i}", np.random.randn(d_model, d_model))
+            self.memory.write(f"wk_{i}", np.random.randn(d_model, d_model))
+            self.memory.write(f"wv_{i}", np.random.randn(d_model, d_model))
+
+            # FFN权重
+            self.memory.write(f"w1_{i}", np.random.randn(d_model, 4*d_model))
+            self.memory.write(f"w2_{i}", np.random.randn(4*d_model, d_model))
+
+            # LayerNorm参数
+            self.memory.write(f"ln1_gamma_{i}", np.ones(d_model))
+            self.memory.write(f"ln1_beta_{i}", np.zeros(d_model))
+            self.memory.write(f"ln2_gamma_{i}", np.ones(d_model))
+            self.memory.write(f"ln2_beta_{i}", np.zeros(d_model))
+
+    def run_inference(self, input_ids):
+        self.memory.total_cycles=0  # 重置周期计数器
+
+        # 输入嵌入（简化实现）
+        batch_size, seq_len=input_ids.shape
+        input_embeds=np.random.randn(
+            batch_size, seq_len, self.config['d_model'])
+        self.memory.write("input_embeds", input_embeds)
+
+        current_key="input_embeds"
+        for layer in self.transformer_layers:
+            layer_input_key=f"{current_key}_copy"
+            self.memory.write(layer_input_key, self.memory.read(current_key))
+            layer(layer_input_key)
+            current_key=f"layer{layer.layer_idx}_output"
+
+        return self.memory.total_cycles
+
+# 测试配置
+test_config={
+    'n_layers': 2,
+    'n_heads': 2,
+    'd_model': 64,
+    'vocab_size': 50257,
+    'mem_read_latency': 10,
+    'mem_write_latency': 5,
+    'dsp_matmul': 16,
+    'cycle_matmul': 2,
+    'dsp_softmax': 8,
+    'cycle_softmax': 3,
+    'dsp_layernorm': 16,
+    'cycle_layernorm': 4,
+    'dsp_add': 32,
+    'cycle_add': 1,
+    'dsp_gelu': 16,
+    'cycle_gelu': 5,
+    'bit_width': 32
+}
+
+# 运行测试
+if __name__ == "__main__":
+    simulator=GPT2Simulator(test_config)
+    input_ids=np.array([[1, 2, 3, 4]])
+    cycles=simulator.run_inference(input_ids)
+    print(f"测试运行完成，总周期数: {cycles}")

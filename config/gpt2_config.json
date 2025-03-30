@@ -1,0 +1,44 @@
+{
+    "memory": {
+        "size": 1073741824,
+        "latency_per_access": 10,
+        "bandwidth": 32,
+        "precision": 32,
+        "map": {
+            "qkv_weight": {
+                "addr": 1048576,
+                "size": 7077888
+            },
+            "out_proj_weight": {
+                "addr": 8126464,
+                "size": 2359296
+            },
+            "ln_weight": {
+                "addr": 10485760,
+                "size": 3072
+            },
+            "ln_bias": {
+                "addr": 10488832,
+                "size": 3072
+            }
+        }
+    },
+    "hardware": {
+        "matmul": {
+            "dsp_limit": 64,
+            "cycles_per_op": 2
+        },
+        "matadd": {
+            "dsp_limit": 128,
+            "cycles_per_op": 1
+        },
+        "softmax": {
+            "dsp_limit": 64,
+            "cycles_per_op": 5
+        },
+        "layernorm": {
+            "dsp_limit": 64,
+            "cycles_per_op": 3
+        }
+    }
+}
