@@ -66,7 +66,13 @@ class BF16:
         """
         实现 BF16 的按位加法。
         """
+        # 0  0 1 1 1 1 1 0 0  0 1 0 0 0 0 0
+        # 15 14            7  6           0
+        #          8bit             7bit
+        # value = (-1)^sign * 2^(e - 127) * 1.frac
         # 提取符号位、指数位和尾数位
+
+        
         def decompose_bf16(bf16):
             sign = (bf16 >> 15) & 0x1  # 符号位
             exponent = (bf16 >> 7) & 0xFF  # 指数位
@@ -81,7 +87,8 @@ class BF16:
         sign_a, exp_a, mant_a = decompose_bf16(bf16_a)
         sign_b, exp_b, mant_b = decompose_bf16(bf16_b)
 
-        # 添加隐含的最高位（1），非零指数时
+        # 添加隐含的最高位（1），非零指数时，当指数为0时代表非常小数，指数为 1111 1111 表示非常大数（若为-则非常小）
+        # 当指数为0时 value = (-1)^sign * 2^(1 - bias) * (0.mantissa)
         if exp_a != 0:
             mant_a |= 0x80
         if exp_b != 0:
@@ -113,9 +120,18 @@ class BF16:
 
         # 归一化结果
         if mant_result & 0x100:  # 尾数溢出，需要右移
+            # 提取最低位，用于舍入
+            round_bit = mant_result & 0x1  # 当前最低位
+
+            # 右移尾数
             mant_result >>= 1
             exp_a += 1
-        while mant_result and not (mant_result & 0x80):  # 尾数不足，需要左移
+
+            # 临近偶数舍入
+            if round_bit and (mant_result & 0x1):
+                mant_result += 1
+
+        while mant_result and not (mant_result & 0x80):  # 尾数不足，需要左移(隐藏位为0了)
             mant_result <<= 1
             exp_a -= 1
 
@@ -203,6 +219,64 @@ def verify_fp32_to_bf16(fp32_value):
     assert custom_bf16 == pytorch_bf16, "Custom implementation does not match PyTorch!"
     print("Custom implementation matches PyTorch!")
 
+def verify_bf16_bitwise_add():
+    """
+    使用 PyTorch 验证 bf16_bitwise_add 函数的实现是否正确。
+    """
+    import torch
+    import struct
+    
+    # 测试用例列表，每个用例包含两个浮点数
+    test_cases = [
+        (1.5, 2.0),      # 简单的相加
+        (-1.5, 2.0),     # 带符号的加法
+        (0.0, 3.14),     # 零和非零
+        (1e-10, 1e10),   # 极端数值
+        (65504.0, 0.1),  # 接近 BF16 最大值
+        (-0.0, 0.0),     # 正零和负零
+    ]
+    
+    for a, b in test_cases:
+        # 1. 将浮点数转换为 BF16 表示
+        tensor_a = torch.tensor(a, dtype=torch.float32)
+        tensor_b = torch.tensor(b, dtype=torch.float32)
+        bf16_a = tensor_a.to(dtype=torch.bfloat16)
+        bf16_b = tensor_b.to(dtype=torch.bfloat16)
+        
+        # 2. 使用 PyTorch 执行 BF16 加法
+        pytorch_result = (bf16_a + bf16_b).to(dtype=torch.float32).item()
+        
+        # 3. 转换为 BF16 整数表示
+        def float_to_bf16_int(f):
+            tensor = torch.tensor(f, dtype=torch.float32)
+            bf16_tensor = tensor.to(dtype=torch.bfloat16)
+            # 将 bf16 转回 float32 然后获取二进制表示
+            bf16_as_f32 = bf16_tensor.to(dtype=torch.float32)
+            # 提取高16位
+            bits = struct.unpack('>I', struct.pack('>f', bf16_as_f32.item()))[0]
+            return (bits >> 16) & 0xFFFF
+        
+        bf16_int_a = float_to_bf16_int(a)
+        bf16_int_b = float_to_bf16_int(b)
+        
+        # 4. 使用自定义函数执行加法
+        custom_result_int = BF16.bf16_bitwise_add(bf16_int_a, bf16_int_b)
+        
+        # 5. 将自定义结果转回浮点数
+        custom_result = BF16.bf16_to_fp32(custom_result_int)
+        
+        # 6. 比较结果
+        print(f"Test case: {a} + {b}")
+        print(f"PyTorch result: {pytorch_result}")
+        print(f"Custom result: {custom_result}")
+        print(f"Equal: {abs(pytorch_result - custom_result) < 1e-5}")
+        print("---")
+        
+        # 7. 补充打印调试信息
+        print(f"BF16 hex - a: {hex(bf16_int_a)}, b: {hex(bf16_int_b)}, result: {hex(custom_result_int)}")
+        print(f"BF16 bits - a: {bin(bf16_int_a)}, b: {bin(bf16_int_b)}, result: {bin(custom_result_int)}")
+        print("\n")
+
 # 测试代码
 if __name__ == "__main__":
     # 测试 FP32 转 BF16
@@ -224,13 +298,4 @@ if __name__ == "__main__":
     for value in test_values:
         verify_fp32_to_bf16(value)
         
-    binary_data = struct.pack('>f', 3.14)
-    print(binary_data) 
-    
-    # 示例 BF16 数值（以整数形式表示）
-    bf16_a = 0x3FC0  # 1.5 in BF16
-    bf16_b = 0x4000  # 2.0 in BF16
-
-    # 按位加法
-    bf16_result = bf16_bitwise_add(bf16_a, bf16_b)
-    print(f"BF16 Add: {hex(bf16_a)} + {hex(bf16_b)} = {hex(bf16_result)}")
+    verify_bf16_bitwise_add()
