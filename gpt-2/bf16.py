@@ -146,6 +146,98 @@ class BF16:
 
         # 组合结果
         return compose_bf16(sign_result, exp_a, mant_result)
+    
+    @staticmethod
+    def bf16_bitwise_multiply(bf16_a, bf16_b):
+        """
+        实现 BF16 的按位乘法。
+        """
+        # 提取符号位、指数位和尾数位
+        def decompose_bf16(bf16):
+            sign = (bf16 >> 15) & 0x1  # 符号位
+            exponent = (bf16 >> 7) & 0xFF  # 指数位
+            mantissa = bf16 & 0x7F  # 尾数位
+            return sign, exponent, mantissa
+
+        # 重新组合 BF16
+        def compose_bf16(sign, exponent, mantissa):
+            return (sign << 15) | (exponent << 7) | (mantissa & 0x7F)
+
+        # 分解两个 BF16 数值
+        sign_a, exp_a, mant_a = decompose_bf16(bf16_a)
+        sign_b, exp_b, mant_b = decompose_bf16(bf16_b)
+
+        # 符号位：相乘后的符号位是两个符号位的异或
+        sign_result = sign_a ^ sign_b
+
+        # 处理特殊情况：零或非规格化数
+        if (exp_a == 0 and mant_a == 0) or (exp_b == 0 and mant_b == 0):
+            return compose_bf16(sign_result, 0, 0)  # 零
+        
+        # 处理特殊情况：无穷大
+        if exp_a == 0xFF or exp_b == 0xFF:
+            return compose_bf16(sign_result, 0xFF, 0)  # 无穷大
+
+        # 添加隐含的最高位（1），对于规格化数
+        if exp_a != 0:
+            mant_a |= 0x80
+        if exp_b != 0:
+            mant_b |= 0x80
+
+        # 指数相加（在乘法中，指数是相加的），并减去偏移值（127）
+        exp_result = exp_a + exp_b - 127
+
+        # 尾数相乘（带隐含的最高位）
+        mant_result = mant_a * mant_b
+
+        # 归一化结果
+        # 尾数相乘后可能有16位（2^8 * 2^8 = 2^16）
+        # 我们需要调整尾数和指数，使尾数的隐含位为1
+
+        # 找到最高有效位
+        msb_pos = 0
+        temp = mant_result
+        while temp:
+            temp >>= 1
+            msb_pos += 1
+
+        # 正常情况下，msb_pos 应该在 14-16 之间（两个7位尾数+两个隐含位相乘）
+        # 需要调整，使隐含位在第8位（0x80）
+        
+        # 调整尾数和指数以规格化结果
+        if msb_pos > 15:  # 需要右移
+            shift = msb_pos - 15
+            # 保存将被丢弃的位，用于舍入
+            round_bits = mant_result & ((1 << shift) - 1)
+            mant_result >>= shift
+            exp_result += shift
+            
+            # 临近偶数舍入
+            half_point = 1 << (shift - 1)
+            if round_bits > half_point or (round_bits == half_point and (mant_result & 0x1)):
+                mant_result += 1
+                
+                # 如果舍入导致进位，再次调整
+                if mant_result & (1 << 15):
+                    mant_result >>= 1
+                    exp_result += 1
+        
+        elif msb_pos < 15:  # 需要左移
+            shift = 15 - msb_pos
+            mant_result <<= shift
+            exp_result -= shift
+
+        # 去掉隐含的最高位，获取7位尾数
+        mant_result = (mant_result >> 8) & 0x7F
+
+        # 处理特殊情况：下溢和上溢
+        if exp_result <= 0:  # 下溢，返回零
+            return compose_bf16(sign_result, 0, 0)
+        if exp_result >= 0xFF:  # 上溢，返回无穷大
+            return compose_bf16(sign_result, 0xFF, 0)
+
+        # 组合结果
+        return compose_bf16(sign_result, exp_result, mant_result)
 
 
     @staticmethod
