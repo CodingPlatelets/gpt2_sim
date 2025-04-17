@@ -100,9 +100,7 @@ def verify_result(m=4, k=7, n=5, random_seed=42):
     else:
         print("\n验证失败：结果不一致！")
         
-import struct
 if __name__ == "__main__":
-    print(struct.pack('>h', 1023))
     verify_result(10,200,30)
 
 
