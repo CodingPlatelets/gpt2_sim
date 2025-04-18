@@ -19,12 +19,37 @@ class BF16:
         将 FP32 转换为 BF16，使用临近偶数位舍入。
         """
 
+        # 0X7F80 : 0 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 正无穷大
+        # 0XFF80 : 1 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 负无穷大
+        # 0XFF90 : 1 1 1 1 | 1 1 1 1 | 1 0 0 1 | 0 0 0 0 NAN 
+        # 0X7F7F : 0 1 1 1 | 1 1 1 1 | 0 1 1 1 | 1 1 1 1 最大正数
+        # 0XFFFF : 1 1 1 1 | 1 1 1 1 |
+        
+        # 0 1 1 1 | 1 1 1 1| 0 1 1 1 | 1 1 1 1  
+        
         # 将 FP32 转换为 32 位整数表示
         fp32_bits = struct.unpack('>I', struct.pack('>f', fp32))[0]
 
+        def decompose_fp32(fp32):
+            sign = (fp32 >> 31) & 0x1
+            exponent = (fp32 >> 23) & 0xFF
+            mantissa = fp32 & 0x7FFFFF
+            return sign, exponent, mantissa
+        
+        
+        fp32_sign, fp32_exponent, fp32_mantissa = decompose_fp32(fp32)
+        
         # 提取高 16 位作为 BF16
         bf16_bits = (fp32_bits >> 16) & 0xFFFF
-
+        
+        #exp全为1，表示inf or nan  
+        if fp32_exponent == 0xFF:
+            #nan_bit =
+            if fp32_mantissa == 0:
+                return bf16_bits
+            return (fp32_sign << 15) | (fp32_exponent << 7) | (fp32_mantissa >> 16) | 0x1
+         
+                 
         # 提取低 16 位用于舍入
         lower_bits = fp32_bits & 0xFFFF
 
@@ -66,6 +91,11 @@ class BF16:
         """
         实现 BF16 的按位加法。
         """
+        # 0X7F80 : 0 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 正无穷大
+        # 0XFF80 : 1 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 负无穷大
+        # 0XFF90 : 1 1 1 1 | 1 1 1 1 | 1 0 0 1 | 0 0 0 0 NAN 
+        # 0XFFFF : 1 1 1 1 | 1 1 1 1 |
+        
         # 0  0 1 1 1 1 1 0 0  0 1 0 0 0 0 0
         # 15 14            7  6           0
         #          8bit             7bit
@@ -117,6 +147,13 @@ class BF16:
             else:
                 mant_result = mant_b - mant_a
                 sign_result = sign_b
+                
+        # 0X7F80 : 0 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 正无穷大
+        # 0XFF80 : 1 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 负无穷大
+        # 0XFF90 : 1 1 1 1 | 1 1 1 1 | 1 0 0 1 | 0 0 0 0 NAN 
+        # 0XFFFF : 1 1 1 1 | 1 1 1 1 |
+        
+        # 0 1 1 1 | 1 1 1 1| 0 1 1 1 | 1 1 1 1
 
         # 归一化结果
         if mant_result & 0x100:  # 尾数溢出，需要右移

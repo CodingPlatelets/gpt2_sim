@@ -8,6 +8,10 @@ class FP32toBF16Pipeline:
         self.stage1_valid = False
         
         self.stage2_fp32 = 0
+        self.stage2_fp32_sign = 0
+        self.stage2_fp32_exponent = 0
+        self.stage2_fp32_mantissa = 0
+        
         self.stage2_high_bits = 0
         self.stage2_low_bits = 0
         self.stage2_valid = False
@@ -22,6 +26,12 @@ class FP32toBF16Pipeline:
     def reset(self):
         """重置流水线状态"""
         self.__init__()
+        
+    def _decompose_fp32(self, fp32):
+        sign = (fp32 >> 31) & 0x1
+        exponent = (fp32 >> 23) & 0xFF
+        mantissa = fp32 & 0x7FFFFF
+        return sign, exponent, mantissa
     
     def clock_cycle(self, new_fp32=None, new_valid=False):
         """
@@ -35,13 +45,29 @@ class FP32toBF16Pipeline:
         self.cycle_count += 1
         
         # 阶段3（舍入阶段）- 直接从阶段2获取数据并执行舍入
+        
+        # 0X7F80 : 0 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 正无穷大
+        # 0XFF80 : 1 1 1 1 | 1 1 1 1 | 1 0 0 0 | 0 0 0 0 负无穷大
+        # 0XFF90 : 1 1 1 1 | 1 1 1 1 | 1 0 0 1 | 0 0 0 0 NAN 
+        # 0X7F7F : 0 1 1 1 | 1 1 1 1 | 0 1 1 1 | 1 1 1 1 最大正数
+        # 0XFFFF : 1 1 1 1 | 1 1 1 1 |
+        
+        # 0 1 1 1 | 1 1 1 1| 0 1 1 1 | 1 1 1 1  
         if self.stage2_valid:
-            # 临近偶数位舍入
-            if (self.stage2_low_bits > 0x8000 or 
-                (self.stage2_low_bits == 0x8000 and self.stage2_high_bits & 1)):
-                self.stage3_bf16 = (self.stage2_high_bits + 1) & 0xFFFF
+            
+            if self.stage2_fp32_exponent == 0xFF:
+                if self.stage2_fp32_mantissa == 0:
+                    self.stage3_bf16 = self.stage2_high_bits
+                else:
+                    self.stage3_bf16 = (self.stage2_fp32_sign << 15) | (self.stage2_fp32_exponent << 7) | (self.stage2_fp32_mantissa >> 16) | 0x1
+                    
             else:
-                self.stage3_bf16 = self.stage2_high_bits
+                # 临近偶数位舍入
+                if (self.stage2_low_bits > 0x8000 or 
+                    (self.stage2_low_bits == 0x8000 and self.stage2_high_bits & 1)):
+                    self.stage3_bf16 = (self.stage2_high_bits + 1) & 0xFFFF
+                else:
+                    self.stage3_bf16 = self.stage2_high_bits
                 
             # 如果是有效输出，添加到输出缓冲区
             self.outputs.append({
@@ -55,6 +81,7 @@ class FP32toBF16Pipeline:
         self.stage2_fp32 = self.stage1_fp32
         self.stage2_high_bits = (self.stage1_fp32 >> 16) & 0xFFFF
         self.stage2_low_bits = self.stage1_fp32 & 0xFFFF
+        self.stage2_fp32_sign, self.stage2_fp32_exponent, self.stage2_fp32_mantissa = self._decompose_fp32(self.stage1_fp32)
         self.stage2_valid = self.stage1_valid
         
         # 阶段1（输入阶段）- 获取新输入
@@ -410,13 +437,29 @@ def test_fp32_to_bf16():
     pipeline = FP32toBF16Pipeline()
     
     # 准备测试数据：[(FP32值, 是否有效), ...]
+    
+    # 可能溢出数据(fp32)
+    
+    # 0 | 1 1 1 || 1 1 1 1 || 1 | 0 0 0|| 0 .... || 0 0 0 0
+    #   7F8F FFFF            
+    # 0 1 1 1 1 1 1 1 
+    
+    data_1 = struct.unpack('>f', struct.pack('>I', 0x7F8FFFFF))[0]
+    data_2 = struct.unpack('>f', struct.pack('>I', 0x7F800000))[0]
+    data_3 = struct.unpack('>f', struct.pack('>I', 0x7F800001))[0]
+    data_4 = struct.unpack('>f', struct.pack('>I', 0xFFFFFFFF))[0]
+    
     test_data = [
         (3.14159, True),  # Pi，十六进制表示为 0x40490FDB
         (1.5, True),      # 1.5，十六进制表示为 0x3FC00000
         (-2.25, True),    # -2.25，十六进制表示为 0xC0100000
-        (0.0, False),     # 无效输入
+        (0.0, True),     # 无效输入
         (65504.0, True),  # BF16能表示的最大正数
         (1e-20, True),    # 非常小的数
+        (data_1, True),  #NAN
+        (data_2, True), #inf
+        (data_3, True),
+        (data_4, True)
     ]
     
     print("Starting FP32 to BF16 Pipeline Simulation")
@@ -424,7 +467,7 @@ def test_fp32_to_bf16():
     
     # 运行模拟
     results = pipeline.run_simulation(test_data)
-    
+    import math    
     print("=" * 50)
     print("Final Outputs:")
     for i, output in enumerate(pipeline.outputs):
@@ -488,14 +531,27 @@ def test_bf16add():
         (1e4, 1e4, True)          # 大数: 10000 + 10000 = 20000
     ]
     
+    def convert_through_pipeline(value):
+        """通过完整流水线模拟转换FP32到BF16"""
+        temp_pipeline = FP32toBF16Pipeline()
+        temp_pipeline.run_simulation([(value, True)], print_states=False)
+        return temp_pipeline.outputs[0]["bf16"] if temp_pipeline.outputs else 0
+
+    bf16_test_cases = [(convert_through_pipeline(a), 
+                        convert_through_pipeline(b), 
+                        valid) for a, b, valid in test_cases]
+    
+    
     # 将浮点数转换为BF16表示
-    bf16_test_cases = [(float_to_bf16(a), float_to_bf16(b), valid) for a, b, valid in test_cases]
+    #bf16_test_cases = [(float_to_bf16(a), float_to_bf16(b), valid) for a, b, valid in test_cases]
     
     print("Starting BF16 Addition Pipeline Simulation")
     print("=" * 50)
     
     # 运行模拟
     results = pipeline.run_simulation(bf16_test_cases)
+    
+    
     
     print("=" * 50)
     print("Final Results:")
@@ -511,5 +567,10 @@ def test_bf16add():
 
 # 测试模拟器
 if __name__ == "__main__":
-    #test_fp32_to_bf16()
-    test_bf16add()
+    test_fp32_to_bf16()
+    #test_bf16add()
+    #t = 0.0
+    #return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
+    #t_bits = struct.unpack('>I', struct.pack('>f', t))[0]
+    #t_bits_float = struct.unpack('>f', struct.pack('>I', t_bits | 0X1))
+    #print(t_bits_float)
