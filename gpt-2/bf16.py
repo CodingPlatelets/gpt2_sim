@@ -112,17 +112,62 @@ class BF16:
         # 重新组合 BF16
         def compose_bf16(sign, exponent, mantissa):
             return (sign << 15) | (exponent << 7) | (mantissa & 0x7F)
+        
+        # 常量定义
+        POS_INF = 0x7F80  # 正无穷大：0 11111111 0000000
+        NEG_INF = 0xFF80  # 负无穷大：1 11111111 0000000
+        NAN = 0x7FC0      # NaN：0 11111111 1000000 
 
         # 分解两个 BF16 数值
         sign_a, exp_a, mant_a = decompose_bf16(bf16_a)
         sign_b, exp_b, mant_b = decompose_bf16(bf16_b)
 
+        # 特殊情况处理
+    
+        # 1. 处理 NaN
+        if ((exp_a == 0xFF and mant_a != 0) or (exp_b == 0xFF and mant_b != 0)):
+            return NAN  # 返回 NaN
+        
+        # 2. 处理无穷大
+        if exp_a == 0xFF:  # a 是无穷大
+            if exp_b == 0xFF and sign_a != sign_b:  # a 和 b 是符号相反的无穷大
+                return NAN  # 无穷大 - 无穷大 = NaN
+            return compose_bf16(sign_a, 0xFF, 0)  # 返回 a 的无穷大
+        
+        if exp_b == 0xFF:  # b 是无穷大
+            return compose_bf16(sign_b, 0xFF, 0)  # 返回 b 的无穷大
+
+        # 3. 处理零值
+        if (exp_a == 0 and mant_a == 0) and (exp_b == 0 and mant_b == 0):
+            # 两个都是零，如果符号相同，返回该符号的零；如果符号不同，返回正零
+            if sign_a == sign_b:
+                return compose_bf16(sign_a, 0, 0)
+            else:
+                return compose_bf16(0, 0, 0)  # 正零
+        
+        if (exp_a == 0 and mant_a == 0):  # a 是零
+            return bf16_b  # 返回 b                      
+    
+        if (exp_b == 0 and mant_b == 0):  # b 是零
+            return bf16_a  # 返回 a
+        
+        
         # 添加隐含的最高位（1），非零指数时，当指数为0时代表非常小数，指数为 1111 1111 表示非常大数（若为-则非常小）
         # 当指数为0时 value = (-1)^sign * 2^(1 - bias) * (0.mantissa)
+
+
+
         if exp_a != 0:
-            mant_a |= 0x80
+            mant_a |= 0x80  # 添加隐含的1
+        else:
+            # 非规格化处理
+            exp_a = 1  # 调整指数
+
         if exp_b != 0:
-            mant_b |= 0x80
+            mant_b |= 0x80  # 添加隐含的1
+        else:
+            # 非规格化处理
+            exp_b = 1  # 调整指数
 
         # 对齐指数
         if exp_a > exp_b:
@@ -155,6 +200,9 @@ class BF16:
         
         # 0 1 1 1 | 1 1 1 1| 0 1 1 1 | 1 1 1 1
 
+        if mant_result == 0:
+            return compose_bf16(0, 0, 0)  # 返回正零
+
         # 归一化结果
         if mant_result & 0x100:  # 尾数溢出，需要右移
             # 提取最低位，用于舍入
@@ -165,8 +213,13 @@ class BF16:
             exp_a += 1
 
             # 临近偶数舍入
-            if round_bit and (mant_result & 0x1):
-                mant_result += 1
+            # 临近偶数舍入
+        if round_bit and (mant_result & 0x1):
+            mant_result += 1
+            # 检查舍入后是否再次溢出
+            if mant_result & 0x100:
+                mant_result >>= 1
+                exp_a += 1
 
         while mant_result and not (mant_result & 0x80):  # 尾数不足，需要左移(隐藏位为0了)
             mant_result <<= 1
@@ -207,44 +260,53 @@ class BF16:
         # 符号位：相乘后的符号位是两个符号位的异或
         sign_result = sign_a ^ sign_b
 
-        # 处理特殊情况：零或非规格化数
+        # 处理特殊情况：NaN 的处理
+        if ((exp_a == 0xFF and mant_a != 0) or (exp_b == 0xFF and mant_b != 0)):
+            return compose_bf16(0, 0xFF, 0x40)  # 返回 NaN
+            
+        # 处理特殊情况：零乘以任何数 = 零
         if (exp_a == 0 and mant_a == 0) or (exp_b == 0 and mant_b == 0):
             return compose_bf16(sign_result, 0, 0)  # 零
         
-        # 处理特殊情况：无穷大
+        # 处理特殊情况：无穷大乘以非零数 = 无穷大
         if exp_a == 0xFF or exp_b == 0xFF:
             return compose_bf16(sign_result, 0xFF, 0)  # 无穷大
 
-        # 添加隐含的最高位（1），对于规格化数
+        # 添加隐含的最高位，处理规格化和非规格化数
         if exp_a != 0:
-            mant_a |= 0x80
+            mant_a |= 0x80  # 添加隐含的1
+        else:
+            # 非规格化处理
+            exp_a = 1  # 调整指数
+            
         if exp_b != 0:
-            mant_b |= 0x80
+            mant_b |= 0x80  # 添加隐含的1
+        else:
+            # 非规格化处理
+            exp_b = 1  # 调整指数
 
         # 指数相加（在乘法中，指数是相加的），并减去偏移值（127）
         exp_result = exp_a + exp_b - 127
 
         # 尾数相乘（带隐含的最高位）
-        mant_result = mant_a * mant_b
+        mant_result = mant_a * mant_b  # 最多可达到16位
 
-        # 归一化结果
-        # 尾数相乘后可能有16位（2^8 * 2^8 = 2^16）
-        # 我们需要调整尾数和指数，使尾数的隐含位为1
+                # 找到最高有效位位置
+        if mant_result == 0:
+            return compose_bf16(sign_result, 0, 0)  # 结果为0
+            
+        msb_pos = mant_result.bit_length() - 1  # 使用内置方法获取最高位位置（从0开始计数）
 
-        # 找到最高有效位
-        msb_pos = 0
-        temp = mant_result
-        while temp:
-            temp >>= 1
-            msb_pos += 1
+        # 直接调整尾数到最终的7位表示
+        # 目标是将msb移动到第7位(对应最终结果的隐含位)
+        target_pos = 7
+        shift = msb_pos - target_pos
 
-        # 正常情况下，msb_pos 应该在 14-16 之间（两个7位尾数+两个隐含位相乘）
-        # 需要调整，使隐含位在第8位（0x80）
-        
-        # 调整尾数和指数以规格化结果
-        if msb_pos > 15:  # 需要右移
-            shift = msb_pos - 15
-            # 保存将被丢弃的位，用于舍入
+        # 1 1 1 1 0 1  shift = 3
+        # round bits = 101
+        # (1 << shift) = 1000 - 1 = 111
+        if shift > 0:  # 需要右移
+            # 舍入位处理
             round_bits = mant_result & ((1 << shift) - 1)
             mant_result >>= shift
             exp_result += shift
@@ -254,22 +316,26 @@ class BF16:
             if round_bits > half_point or (round_bits == half_point and (mant_result & 0x1)):
                 mant_result += 1
                 
-                # 如果舍入导致进位，再次调整
-                if mant_result & (1 << 15):
+                # 如果舍入导致进位(超出7位)
+                if mant_result & 0x100:
                     mant_result >>= 1
                     exp_result += 1
-        
-        elif msb_pos < 15:  # 需要左移
-            shift = 15 - msb_pos
-            mant_result <<= shift
-            exp_result -= shift
 
-        # 去掉隐含的最高位，获取7位尾数
-        mant_result = (mant_result >> 8) & 0x7F
+        elif shift < 0:  # 需要左移
+            mant_result <<= -shift
+            exp_result += shift  # 注意这里是减小指数(shift是负的)
+
+        # 去掉隐含的最高位，直接获取7位尾数
+        mant_result &= 0x7F
 
         # 处理特殊情况：下溢和上溢
-        if exp_result <= 0:  # 下溢，返回零
-            return compose_bf16(sign_result, 0, 0)
+        if exp_result <= 0:  # 下溢，返回零或非规格化数
+            if exp_result < -7:  # 太小，直接返回零
+                return compose_bf16(sign_result, 0, 0)
+            else:  # 尝试以非规格化形式表示
+                mant_result = (mant_result | 0x80) >> (1 - exp_result)
+                return compose_bf16(sign_result, 0, mant_result & 0x7F)
+                
         if exp_result >= 0xFF:  # 上溢，返回无穷大
             return compose_bf16(sign_result, 0xFF, 0)
 
