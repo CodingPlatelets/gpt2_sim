@@ -118,7 +118,7 @@ class AdderTree:
         if len(self.add_pipeline_lower[0].outputs) and len(self.add_pipeline_lower[1].outputs):
             next_level.append(self.add_pipeline_lower[0].outputs.pop(0))
             next_level.append(self.add_pipeline_lower[1].outputs.pop(0))
-
+        
         #next_level.append(np.float32(self.values[i] + self.values[i + 1]))
         
         self.intermediate_results = next_level
@@ -208,6 +208,7 @@ class PipelineSimulator:
         self.clock_cycle = 0
         self.log = []
         self.input = [] # 模块的输入数据
+        self.ijQueue = []
         
         self.stage1_valid = True
         self.stage1_input = []
@@ -252,7 +253,7 @@ class PipelineSimulator:
             reduced = self.adder_tree.tick_second_stage()
             if reduced is not None:
                 result = reduced
-                result_coords = self.stage4_coords
+                result_coords = self.ijQueue.pop(0)
             self.stage4_valid = False
             
         # stage3：处理前一个周期 stage2 的第一阶段加法
@@ -260,7 +261,7 @@ class PipelineSimulator:
             intermediate = self.adder_tree.tick_first_stage()
             if intermediate:
                 self.stage4_valid = True
-                self.stage4_coords = self.stage3_coords
+                #self.stage4_coords = self.stage3_coords
             self.stage3_valid = False
             
         # stage2：处理前一个周期 stage1 的MAC计算
@@ -268,10 +269,11 @@ class PipelineSimulator:
             if self.stage2_input[0] is not None and self.stage2_input[1] is not None:
                 self.mac_line.get_input(self.stage2_input)
                 results = self.mac_line.tick()
+                #print(bf16_to_float_block(results))
                 if len(results):
                     self.adder_tree.add_values(results)
                     self.stage3_valid = True
-                    self.stage3_coords = self.stage2_coords  # 传递坐标信息
+                    #self.stage3_coords = self.stage2_coords  # 传递坐标信息
             self.stage2_valid = False
             
         # stage1：接收新数据
@@ -279,11 +281,12 @@ class PipelineSimulator:
             # 确保转换为float32以匹配numpy
             self.stage1_output = [a_block, b_block]
             
-            print(bf16_to_float_block(a_block))
-            print(bf16_to_float_block(b_block))
+            #print(f"stage1 block {bf16_to_float_block(a_block)}")
+            #print(f"stage2 block {bf16_to_float_block(b_block)}")
             
             self.stage2_input = self.stage1_output
-            self.stage2_coords = coords
+            #self.stage2_coords = coords
+            self.ijQueue.append(coords)
             self.stage2_valid = True
             
         # 记录当前阶段的状态（处理后）
@@ -403,8 +406,8 @@ def pipeline_matmul(A, B, verbose=False):
             a_block = [float(a) for a in a_block.tolist()]
             b_block = [float(b) for b in b_block.tolist()]
             
-            print(a_block)
-            print(b_block)
+            #print(f"原始a_block {a_block}")
+            #print(f"原始b_block {b_block}")
             
             a_block = [convert_through_pipeline(a) for a in a_block]
             b_block = [convert_through_pipeline(b) for b in b_block]
@@ -436,6 +439,7 @@ def pipeline_matmul(A, B, verbose=False):
             result_value = bf16_to_float(result_value)
             i, j = result_coords
             C[i][j] += result_value
+            print(C[i][j])
             #print(C[i][j])
 
         # 更新状态记录 (如果需要)
@@ -473,6 +477,8 @@ def verify_result(m=4, k=7, n=5, random_seed=42, verbose=True):
     np.random.seed(random_seed)
     A = np.random.randint(0, 10, size=(m, k))
     B = np.random.randint(0, 10, size=(k, n))
+    print(A)
+    print(B)
     C_np = A @ B
     #print(C_np)
     C_mac = pipeline_matmul(A, B, verbose=verbose)
