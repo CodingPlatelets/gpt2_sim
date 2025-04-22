@@ -1319,8 +1319,8 @@ def test_bf16multiply():
 
 # 测试模拟器
 if __name__ == "__main__":
-    test_fp32_to_bf16()
-    #test_bf16add()
+    #test_fp32_to_bf16()
+    test_bf16add()
     #test_bf16multiply()
     #t = 0.0
     #return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]

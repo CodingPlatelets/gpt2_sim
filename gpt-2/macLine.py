@@ -1,53 +1,73 @@
 import numpy as np
+from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
+import struct
+
+
+def bf16_to_float_block(bf16_block):
+    # 左移16位填充为32位表示
+    float_block = []
+    for bf16 in bf16_block:
+        fp32_bits = bf16 << 16
+        float_block.append(struct.unpack('>f', struct.pack('>I', fp32_bits))[0])
+    # 转换为浮点数
+    return float_block
 
 class MACUnit:
     def __init__(self, clock_cycle=2):
-        self.state = []  # list of (a, b, remaining_cycles)
-        self.clock_cycle = clock_cycle 
+        self.multliply_pipeline = BF16MultiplyPipeline()
+        self.state = None  # list of (a, b, remaining_cycles)
+        #self.clock_cycle = clock_cycle 
         self.result = None
 
     def is_busy(self):
         return len(self.state) > 0
+    
+    def get_input(self, a, b):
+        self.state = (a, b, True) 
 
-    def enqueue(self, a, b):
-        self.state.append([a, b, self.clock_cycle])  # 每个MAC运算耗2周期
-
+    #def enqueue(self, a, b):
     def tick(self):
         if not self.state:
             return None
-        a, b, _ = self.state.pop(0)
-        return a * b
+        
+        self.multliply_pipeline.clock_cycle(self.state[0], self.state[1], self.state[2])
+        if len(self.multliply_pipeline.outputs) == 0:
+            return None
+        return self.multliply_pipeline.outputs.pop(0)
 
 class MACLine:
     def __init__(self, mac_width):
         self.macs = [MACUnit() for _ in range(mac_width)]
-        self.input_queue = []  # list of (a_block, b_block)
+        self.input = []  # list of [a_block, b_block]
 
-    def enqueue(self, a_block, b_block):
-        self.input_queue.append((a_block, b_block))
-    
+    #def enqueue(self, ab_block):
+    #    self.input_queue.append(ab_block)
+    def get_input(self, input):
+        self.input = input
+      
     def reset(self):
-        self.input_queue = []
+        self.input = []
         for mac in self.macs:
             mac.state = []
             mac.result = None
             
     def is_active(self):
-        return self.input_queue or any(mac.is_busy() for mac in self.macs)
+        return self.input or any(mac.is_busy() for mac in self.macs)
 
     def tick(self):
         results = []
-        if not self.input_queue:  # 防止访问空队列
+        if not self.input:  # 防止访问空队列
             return None
         
         for i, mac in enumerate(self.macs):
-            if i < len(self.input_queue[0][0]) and i < len(self.input_queue[0][1]):
-                mac.enqueue(self.input_queue[0][0][i], self.input_queue[0][1][i])
-                r = mac.tick()
+            #if i < len(self.input_queue[0][0]) and i < len(self.input_queue[0][1]):
+            mac.get_input(self.input[0][i], self.input[1][i])
+            r = mac.tick()
+            if r is not None:
                 results.append(r)  # 即使是 None 也添加到结果中
         
-        if self.input_queue:  # 处理完后移除队列中的元素
-            self.input_queue.pop(0)
+        #if self.input_queue:  # 处理完后移除队列中的元素
+        #    self.input_queue.pop(0)
         
         return results
 
@@ -57,11 +77,20 @@ class AdderTree:
         self.values = []
         self.busy = False
         self.intermediate_results = []  # 存储第一阶段的中间结果
+        self.add_pipeline_lower = [BF16AddPipeline(), BF16AddPipeline()]
+        self.add_pipeline_upper = BF16AddPipeline()
+        self.input = []
+        self.values_pack = []
 
     def add_values(self, values):
         # 确保过滤None值并使用float32类型确保精度一致
-        self.values.extend([np.float32(v) for v in values if v is not None])
+        self.values = values
         self.busy = True
+        
+    def pack_values(self):
+        for i in range(0, len(self.values), 2):
+            self.values_pack.append((self.values[i], self.values[i + 1], True))
+        #print(self.values_pack)
 
     def is_active(self):
         return self.busy and (self.values or self.intermediate_results)
@@ -73,16 +102,24 @@ class AdderTree:
     
     def tick_first_stage(self):
         """第一阶段：将4个输入合并为2个中间结果"""
+        #print(self.values)
         if not self.values:
             return None
-        
+        # 4
         # 计算第一级加法结果，确保类型一致
         next_level = []
-        for i in range(0, len(self.values), 2):
-            if i + 1 < len(self.values):
-                next_level.append(np.float32(self.values[i] + self.values[i + 1]))
-            else:
-                next_level.append(np.float32(self.values[i]))
+        self.pack_values()
+        
+        #print(self.values_pack)
+        
+        self.add_pipeline_lower[0].clock_cycle(self.values_pack[0][0], self.values_pack[0][1], self.values_pack[0][2])
+        self.add_pipeline_lower[1].clock_cycle(self.values_pack[1][0], self.values_pack[1][1], self.values_pack[1][2])
+
+        if len(self.add_pipeline_lower[0].outputs) and len(self.add_pipeline_lower[1].outputs):
+            next_level.append(self.add_pipeline_lower[0].outputs.pop(0))
+            next_level.append(self.add_pipeline_lower[1].outputs.pop(0))
+
+        #next_level.append(np.float32(self.values[i] + self.values[i + 1]))
         
         self.intermediate_results = next_level
         self.values = []
@@ -93,8 +130,11 @@ class AdderTree:
         if not self.intermediate_results:
             return None
         
+        final_result = None
         # 计算第二级加法结果，确保类型一致
-        final_result = np.float32(sum(self.intermediate_results))
+        self.add_pipeline_upper.clock_cycle(self.intermediate_results[0], self.intermediate_results[1], True)
+        if len(self.add_pipeline_upper.outputs):
+            final_result = self.add_pipeline_upper.outputs.pop(0)
         self.intermediate_results = []
         self.busy = False
         return final_result
@@ -226,9 +266,9 @@ class PipelineSimulator:
         # stage2：处理前一个周期 stage1 的MAC计算
         if self.stage2_valid:
             if self.stage2_input[0] is not None and self.stage2_input[1] is not None:
-                self.mac_line.enqueue(self.stage2_input[0], self.stage2_input[1])
+                self.mac_line.get_input(self.stage2_input)
                 results = self.mac_line.tick()
-                if results:
+                if len(results):
                     self.adder_tree.add_values(results)
                     self.stage3_valid = True
                     self.stage3_coords = self.stage2_coords  # 传递坐标信息
@@ -237,8 +277,11 @@ class PipelineSimulator:
         # stage1：接收新数据
         if a_block is not None and b_block is not None:
             # 确保转换为float32以匹配numpy
-            self.stage1_output = [np.array(a_block, dtype=np.float32), 
-                                np.array(b_block, dtype=np.float32)]
+            self.stage1_output = [a_block, b_block]
+            
+            print(bf16_to_float_block(a_block))
+            print(bf16_to_float_block(b_block))
+            
             self.stage2_input = self.stage1_output
             self.stage2_coords = coords
             self.stage2_valid = True
@@ -281,6 +324,12 @@ class PipelineSimulator:
         """检查流水线是否正在处理数据"""
         return (self.stage2_valid or self.stage3_valid or self.stage4_valid or 
                 any(mac.is_busy() for mac in self.mac_line.macs))
+        
+def convert_through_pipeline(value):
+    """通过完整流水线模拟转换FP32到BF16"""
+    temp_pipeline = FP32toBF16Pipeline()
+    temp_pipeline.run_simulation([(value, True)], print_states=False)
+    return temp_pipeline.outputs[0]["bf16"] if temp_pipeline.outputs else 0
 
 def pipeline_matmul(A, B, verbose=False):
     assert A.shape[1] == B.shape[0]
@@ -337,6 +386,8 @@ def pipeline_matmul(A, B, verbose=False):
     
     # 运行直到输入队列为空且流水线不再活跃
     while input_queue or sim.is_active():
+        #print(input_queue)
+        #print(sim.is_active())
         current_input_log = None
         completed_element_log = None
         
@@ -349,6 +400,15 @@ def pipeline_matmul(A, B, verbose=False):
             block_idx = data["block_index"]
             is_last_block = data["is_last_block"]
             last_coords = coords  # 更新最后处理的坐标
+            a_block = [float(a) for a in a_block.tolist()]
+            b_block = [float(b) for b in b_block.tolist()]
+            
+            print(a_block)
+            print(b_block)
+            
+            a_block = [convert_through_pipeline(a) for a in a_block]
+            b_block = [convert_through_pipeline(b) for b in b_block]
+            #print(a_block)
             
             current_input_log = {
                 "coords": coords,
@@ -363,23 +423,20 @@ def pipeline_matmul(A, B, verbose=False):
 
         # 运行一个时钟周期,将坐标与数据一起传递给流水线
         partial_result = sim.process_block(a_block, b_block, coords, is_last_block)
+        import struct
+        def bf16_to_float(bf16):
+            # 左移16位填充为32位表示
+            fp32_bits = bf16 << 16
+            # 转换为浮点数
+            return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
         
         # 处理返回的部分结果
         if partial_result is not None:
             result_coords, result_value = partial_result
+            result_value = bf16_to_float(result_value)
             i, j = result_coords
-            if (i, j) in element_tracker:
-                tracker = element_tracker[(i, j)]
-                tracker["blocks_processed"] += 1
-                tracker["partial_results"].append(result_value)
-                
-                # 判断当前矩阵元素Cij是否所有数据块均已计算完毕
-                if tracker["blocks_processed"] == tracker["blocks_total"]:
-                    total_result = np.float32(sum(tracker["partial_results"]))
-                    tracker["result"] = total_result
-                    C[i][j] = total_result
-                    logs.append(f"C[{i}][{j}] computed in {sim.clock_cycle} cycles => {total_result}")
-                    completed_element_log = {"coords": (i, j), "value": total_result}
+            C[i][j] += result_value
+            #print(C[i][j])
 
         # 更新状态记录 (如果需要)
         if verbose and hasattr(sim.status, "cycles") and sim.status.cycles:
@@ -389,6 +446,7 @@ def pipeline_matmul(A, B, verbose=False):
         
         # 增加时钟周期
         sim.clock_cycle += 1
+        #print(sim.clock_cycle)
     
     # 循环结束后，再次检查所有元素的任务记录，检查并处理可能未完全累加的结果 (理论上不应发生，但作为保险)
     for coords, tracker in element_tracker.items():
@@ -415,8 +473,11 @@ def verify_result(m=4, k=7, n=5, random_seed=42, verbose=True):
     np.random.seed(random_seed)
     A = np.random.randint(0, 10, size=(m, k))
     B = np.random.randint(0, 10, size=(k, n))
-    C_mac = pipeline_matmul(A, B, verbose=verbose)
     C_np = A @ B
+    #print(C_np)
+    C_mac = pipeline_matmul(A, B, verbose=verbose)
+    
+    
     if np.allclose(C_mac, C_np):
         print("验证成功：结果一致！")
     else:
