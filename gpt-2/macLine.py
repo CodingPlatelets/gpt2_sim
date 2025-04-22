@@ -52,7 +52,6 @@ class MACLine:
         return results
 
 # 修改：将AdderTree拆分为两个阶段
-# 修改：将AdderTree拆分为两个阶段，修复精度问题
 class AdderTree:
     def __init__(self):
         self.values = []
@@ -283,8 +282,7 @@ class PipelineSimulator:
         return (self.stage2_valid or self.stage3_valid or self.stage4_valid or 
                 any(mac.is_busy() for mac in self.mac_line.macs))
 
-
-def pipeline_matmul(A, B, verbose=True):
+def pipeline_matmul(A, B, verbose=False):
     assert A.shape[1] == B.shape[0]
     m, k = A.shape
     n = B.shape[1]
@@ -294,132 +292,119 @@ def pipeline_matmul(A, B, verbose=True):
     # 创建一个持久的流水线模拟器
     sim = PipelineSimulator()
     
-    # 创建元素跟踪字典，记录每个矩阵元素的状态
+    # 创建元素跟踪字典和输入队列
     element_tracker = {}  # {(i,j): {"blocks_total": x, "blocks_processed": y, "result": value}}
-    
-    # 准备所有矩阵元素的计算任务
-    all_tasks = []
+    input_queue = []      # 存储待处理的数据块
+
+    # 准备所有计算任务并直接放入输入队列
     for i in range(m):
         for j in range(n):
-            all_tasks.append((i, j, A[i,:], B[:, j]))
-    
-    # 连续向流水线中添加任务
-    task_index = 0
-    current_element = None  # 当前正在准备数据的元素坐标
-    last_coords = None  # 跟踪最后一个处理的坐标
-    
-    # 运行直到所有任务都被处理完
-    while task_index < len(all_tasks) or sim.input or sim.is_active():
-        # 记录当前周期的输入数据
-        current_input = None
-        completed_element = None
-        
-        # 如果流水线的stage1空闲并且还有任务，就添加新任务
-        if task_index < len(all_tasks) and not sim.input:
-            i, j, a_row, b_col = all_tasks[task_index]
-            current_element = (i, j)
-            last_coords = current_element  # 更新最后处理的坐标
-            
-            # 初始化该元素的跟踪信息
+            a_row = A[i,:]
+            b_col = B[:,j]
             k_len = len(a_row)
             blocks_total = (k_len + sim.mac_width - 1) // sim.mac_width  # 向上取整
+            
+            # 初始化该元素的跟踪信息
             element_tracker[(i, j)] = {
                 "blocks_total": blocks_total,
                 "blocks_processed": 0,
                 "partial_results": [],
                 "result": None
             }
-            
-            # 准备该元素的所有数据块
+
+            # 准备该元素的所有数据块并加入队列
             for block_start in range(0, k_len, sim.mac_width):
                 a_block = a_row[block_start:block_start + sim.mac_width]
                 b_block = b_col[block_start:block_start + sim.mac_width]
                 
+                # 补齐不足的块
                 if len(a_block) < sim.mac_width:
-                    a_block = np.pad(a_block, (0, sim.mac_width - len(a_block)))
-                    b_block = np.pad(b_block, (0, sim.mac_width - len(b_block)))
+                    a_block = np.pad(a_block, (0, sim.mac_width - len(a_block))).astype(np.float32)
+                    b_block = np.pad(b_block, (0, sim.mac_width - len(b_block))).astype(np.float32)
                 
                 block_index = block_start // sim.mac_width
                 is_last_block = (block_start + sim.mac_width >= k_len)
                 
-                # 数据块附带元素坐标和块信息
-                sim.input.append({
+                input_queue.append({
                     "a_block": a_block,
                     "b_block": b_block,
                     "coords": (i, j),
                     "block_index": block_index,
                     "is_last_block": is_last_block
                 })
-            
-            task_index += 1
+
+    last_coords = None  # 跟踪最后一个处理的坐标
+    
+    # 运行直到输入队列为空且流水线不再活跃
+    while input_queue or sim.is_active():
+        current_input_log = None
+        completed_element_log = None
         
-        # 运行一个时钟周期
-        if sim.input:
-            data = sim.input.pop(0)
+        # 从队列获取数据或处理流水线空闲周期
+        if input_queue:
+            data = input_queue.pop(0)
             a_block = data["a_block"]
             b_block = data["b_block"]
             coords = data["coords"]
             block_idx = data["block_index"]
-            last_coords = coords  # 更新最后处理的坐标
             is_last_block = data["is_last_block"]
+            last_coords = coords  # 更新最后处理的坐标
             
-            # 记录当前输入
-            current_input = {
+            current_input_log = {
                 "coords": coords,
                 "block_idx": block_idx,
                 "is_last": is_last_block
             }
-            
-            # 使用修改后的process_block方法
-            partial_result = sim.process_block(a_block, b_block, coords, is_last_block)
         else:
-            # 如果没有输入但流水线仍活跃，继续处理
-            # 关键修改：使用最后一个有效坐标而不是(-1,-1)
-            partial_result = sim.process_block(None, None, last_coords, True)
-            current_input = None
+            # 输入队列为空，但流水线仍活跃，继续推进
+            a_block, b_block, coords = None, None, last_coords
+            is_last_block = True # 假设在排空阶段，需要标记结束
+            current_input_log = None
+
+        # 运行一个时钟周期,将坐标与数据一起传递给流水线
+        partial_result = sim.process_block(a_block, b_block, coords, is_last_block)
         
-        # 如果有结果返回，则更新元素的部分结果
+        # 处理返回的部分结果
         if partial_result is not None:
             result_coords, result_value = partial_result
             i, j = result_coords
-            if (i, j) in element_tracker:  # 确保这个坐标在tracker中
-                element_tracker[(i, j)]["blocks_processed"] += 1
-                element_tracker[(i, j)]["partial_results"].append(result_value)
+            if (i, j) in element_tracker:
+                tracker = element_tracker[(i, j)]
+                tracker["blocks_processed"] += 1
+                tracker["partial_results"].append(result_value)
                 
-                # 如果所有块都处理完了，计算最终结果
-                if element_tracker[(i, j)]["blocks_processed"] == element_tracker[(i, j)]["blocks_total"]:
-                    total_result = sum(element_tracker[(i, j)]["partial_results"])
-                    element_tracker[(i, j)]["result"] = total_result
+                # 判断当前矩阵元素Cij是否所有数据块均已计算完毕
+                if tracker["blocks_processed"] == tracker["blocks_total"]:
+                    total_result = np.float32(sum(tracker["partial_results"]))
+                    tracker["result"] = total_result
                     C[i][j] = total_result
                     logs.append(f"C[{i}][{j}] computed in {sim.clock_cycle} cycles => {total_result}")
-                    completed_element = {"coords": (i, j), "value": total_result}
-        
-        # 更新状态记录，添加输入信息和完成的元素信息
-        if hasattr(sim.status, "cycles") and sim.status.cycles:
+                    completed_element_log = {"coords": (i, j), "value": total_result}
+
+        # 更新状态记录 (如果需要)
+        if verbose and hasattr(sim.status, "cycles") and sim.status.cycles:
             latest_cycle = sim.status.cycles[-1]
-            latest_cycle["input"] = current_input
-            latest_cycle["completed"] = completed_element
+            latest_cycle["input"] = current_input_log
+            latest_cycle["completed"] = completed_element_log
         
         # 增加时钟周期
         sim.clock_cycle += 1
     
-    # 检查是否有未完成的元素
+    # 循环结束后，再次检查所有元素的任务记录，检查并处理可能未完全累加的结果 (理论上不应发生，但作为保险)
     for coords, tracker in element_tracker.items():
         i, j = coords
         if tracker["result"] is None and tracker["partial_results"]:
-            # 有部分结果但未完成的元素，手动完成
-            total_result = sum(tracker["partial_results"])
+            total_result = np.float32(sum(tracker["partial_results"]))
             C[i][j] = total_result
-    
-    
-    # 打印流水线状态历史
+            # logs.append(f"C[{i}][{j}] completed manually at end => {total_result}") # 可选日志
+
+    # 打印详细信息
     if verbose:
         sim.status.print_status(detailed=False)
-    
-    # 打印计算日志
-    for log in logs:
-        print(log)
-    
+        # 打印计算日志
+        for log in logs:
+            print(log)
+            
     return C
 
 def verify_result(m=4, k=7, n=5, random_seed=42, verbose=True):
@@ -433,9 +418,9 @@ def verify_result(m=4, k=7, n=5, random_seed=42, verbose=True):
     C_mac = pipeline_matmul(A, B, verbose=verbose)
     C_np = A @ B
     if np.allclose(C_mac, C_np):
-        print("\n验证成功：结果一致！")
+        print("验证成功：结果一致！")
     else:
-        print("\n验证失败：结果不一致！")
+        print("验证失败：结果不一致！")
     
 if __name__ == '__main__':
-    verify_result(m=4, k=4, n=5, random_seed=42)
+    verify_result(m=4, k=10, n=5, random_seed=42)
