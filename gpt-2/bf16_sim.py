@@ -220,6 +220,8 @@ class BF16AddPipeline:
         self.stage4_exp_result = 0
         self.stage4_mant_result = 0
         
+        self.stage5_valid = False
+        
         # 常量定义
         self.POS_INF = 0x7F80  # 正无穷大：0 11111111 0000000
         self.NEG_INF = 0xFF80  # 负无穷大：1 11111111 0000000
@@ -291,6 +293,7 @@ class BF16AddPipeline:
         self.cycle_count += 1
         
         # 阶段4: 归一化和组合阶段 - 处理阶段3的输出
+        self.stage5_valid = self.stage4_valid
         if self.stage4_valid:
             result_bf16 = 0
             
@@ -489,7 +492,7 @@ class BF16AddPipeline:
         # 返回当前周期的状态
         return {
             "cycle": self.cycle_count,
-            "valid_output": self.stage4_valid,
+            "valid_output": self.stage5_valid,
             "pipeline_state": self.get_pipeline_state()
         }
     
@@ -552,7 +555,7 @@ class BF16AddPipeline:
         results = []
         
         # 确保输入列表足够长，不足部分用(0, 0, False)填充
-        extended_inputs = list(inputs) + [(0, 0, False)] * 3  # 加4个周期确保流水线清空
+        extended_inputs = list(inputs) + [(0, 0, False)] * 4  # 加4个周期确保流水线清空
         
         #print("cycle长度")
 
@@ -603,6 +606,8 @@ class BF16MultiplyPipeline:
         self.stage4_exp_result = 0
         self.stage4_mant_result = 0
         self.stage4_msb_pos = 0
+        
+        self.stage5_valid = False
         
         # 常量定义
         self.POS_INF = 0x7F80  # 正无穷大：0 11111111 0000000
@@ -668,6 +673,8 @@ class BF16MultiplyPipeline:
         self.cycle_count += 1
         
         # 阶段5: 输出阶段 - 处理阶段4的规范化和舍入结果
+        self.stage5_valid = self.stage4_valid
+        
         if self.stage4_valid:
             result_bf16 = 0
             
@@ -833,7 +840,7 @@ class BF16MultiplyPipeline:
         # 返回当前周期的状态
         return {
             "cycle": self.cycle_count,
-            "valid_output": self.stage4_valid,
+            "valid_output": self.stage5_valid,
             "pipeline_state": self.get_pipeline_state()
         }
     
@@ -982,6 +989,15 @@ def test_fp32_to_bf16():
             print(f"  Pipeline output:   {hex(pipeline_result)}")
             print(f"  Match: {direct_result == pipeline_result}")
             
+def bf16_add(bf16_a, bf16_b):
+    sim = BF16AddPipeline()
+    sim.run_simulation([(bf16_a, bf16_b, True)], False)
+    return sim.outputs[0]
+
+def bf16_mul(bf16_a, bf16_b):
+    sim = BF16MultiplyPipeline()
+    sim.run_simulation([(bf16_a, bf16_b, True)], False)
+    return sim.outputs[0]
 def test_bf16add():
     # 创建流水线实例
     pipeline = BF16AddPipeline()
@@ -1171,6 +1187,7 @@ def test_bf16multiply():
     # 准备常规测试用例
     regular_cases = [
         (2.0, 3.0, True),        # 简单乘法: 2.0 * 3.0 = 6.0
+        (3.124, 2.249, True),
         (1.5, 2.25, True),       # 小数乘法: 1.5 * 2.25 = 3.375
         (3.14159, -1.5, True),   # 异号乘法: 3.14159 * (-1.5) ≈ -4.71
         (-3.0, -2.0, True),      # 负数乘法: (-3.0) * (-2.0) = 6.0
