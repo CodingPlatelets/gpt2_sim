@@ -97,21 +97,43 @@ class ShiftUnit:
         
 
 class MFIU:
-    def __init__(self, width=4, bit_width=4):
+    def __init__(self, width=None, bit_width=None):
         self.width = width
         self.bit_width = bit_width
-        self.A_bit_mask_vec = [0] * width
-        self.B_bit_mask_vec = [0] * width
-        self.A_row_offset_vec = [0] * width
-        self.B_col_offset_vec = [0] * width
-        self.AB_bit_vec = [0] * width
-        self.AB_prefix_sum = [] 
-        self.ec_idx_vec = [[] for _ in range(width)]
+        #self.A_bit_mask_vec = [0] * width
+        #self.B_bit_mask_vec = [0] * width
+        #self.A_row_offset_vec = [0] * width
+        #self.B_col_offset_vec = [0] * width
+        #self.AB_bit_vec = [0] * width
+        #self.AB_prefix_sum = [] 
+        #self.ec_idx_vec = [[] for _ in range(width)]
         
 
     def get_mask_offset_values(self, mask_A_row, mask_B_col, offset_A_row, offset_B_col, values_A, values_B):
         
-        assert(len(mask_B_col) * len(mask_A_row) == self.width)
+        #assert(len(mask_B_col) * len(mask_A_row) == self.width)
+
+        rows_A = len(mask_A_row)
+        cols_B = len(mask_B_col)
+        
+        if self.width is None:
+            self.width = rows_A * cols_B
+        
+        max_dim_A = len(bin(max(mask_A_row))) - 2 if mask_A_row else 0  
+        max_dim_B = len(bin(max(mask_B_col))) - 2 if mask_B_col else 0
+        
+        if self.bit_width is None:
+            self.bit_width = max(max_dim_A, max_dim_B)
+        
+       
+        self.A_bit_mask_vec = [0] * self.width
+        self.B_bit_mask_vec = [0] * self.width
+        self.A_row_offset_vec = [0] * self.width
+        self.B_col_offset_vec = [0] * self.width
+        self.AB_bit_vec = [0] * self.width
+        self.AB_prefix_sum = []
+        self.ec_idx_vec = [[] for _ in range(self.width)]
+
         idx = 0
         for i in range(len(mask_B_col)):
             for j in range(len(mask_A_row)):
@@ -214,25 +236,55 @@ def get_values_offset_mask(matrix:csr_matrix):
 
 if __name__ == "__main__":
 
-    A = np.array([[1, 1, 1, 1],
-                [1, 1, 1, 1]])
+    #A = np.array([[1, 1, 1, 1],
+    #            [1, 1, 1, 1]])
+
+    A = np.array([[1, 0, 1, 0], [0, 1, 1, 0]])
+
+    #A = np.array([[1, 1, 1, 0, 1], 
+    #              [0, 1, 1, 1, 0]])
+
     csr_A = csr_matrix(A)
     print(csr_A)
 
-    B = np.array([[1, 1], [1, 1], [1, 1], [1, 1]])
+    #B = np.array([[1, 1], [1, 1], [1, 1], [1, 1]])
+    #B = np.array([[1, 1], [1, 0], [0, 1], [1, 1], [0, 1]])
+    B = np.array([[1, 1], [0, 0], [0, 1], [1, 0]])
     csr_B = csr_matrix(B.T)
 
     value_A, offset_A, masks_A = get_values_offset_mask(csr_A)
     value_B, offset_B, masks_B = get_values_offset_mask(csr_B)
 
-    print(offset_A)
+    print(masks_A)
+
+    print(masks_B)
 
     print("Masks as binary:", [bin(m) for m in masks_A])
     
-    mfiu = MFIU(4, 4)
+    #mfiu = MFIU(4, 4)
+    mfiu = MFIU()
     mfiu.get_mask_offset_values(masks_A, masks_B, offset_A, offset_B, value_A, value_B)
     mfiu()
     mfiu.print_state()
+
+
+    A2 = np.random.randint(0, 2, (3, 5))
+    B2 = np.random.randint(0, 2, (5, 2))
+
+    print(A2)
+    print(B2)
+    
+    csr_A2 = csr_matrix(A2)
+    csr_B2 = csr_matrix(B2.T)
+    
+    value_A2, offset_A2, masks_A2 = get_values_offset_mask(csr_A2)
+    value_B2, offset_B2, masks_B2 = get_values_offset_mask(csr_B2)
+    
+    print("\n测试2: 3x5 和 5x2 矩阵")
+    mfiu2 = MFIU()
+    mfiu2.get_mask_offset_values(masks_A2, masks_B2, offset_A2, offset_B2, value_A2, value_B2)
+    mfiu2()
+    mfiu2.print_state()
 
    
 
