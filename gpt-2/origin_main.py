@@ -9,11 +9,11 @@ import torch
 import random
 import argparse
 import numpy as np
-from .model import (GPT2LMHeadModel)
-from .utils import load_weight
-from .config import GPT2Config
-from .sample import sample_sequence
-from .encoder import get_encoder
+from model import GPT2LMHeadModel
+from utils.utils import load_weight
+from config import GPT2Config
+from sample import sample_sequence
+from utils.encoder import get_encoder
 
 
 def text_generator(state_dict):
@@ -84,4 +84,5 @@ if __name__ == '__main__':
         text_generator(state_dict)
     else:
         print('Please download gpt2-pytorch_model.bin')
-        sys.exit()
+        sys.exit(1)
+
