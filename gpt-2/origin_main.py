@@ -84,5 +84,4 @@ if __name__ == '__main__':
         text_generator(state_dict)
     else:
         print('Please download gpt2-pytorch_model.bin')
-        sys.exiggg
-ggpt-
+        sys.exit()
