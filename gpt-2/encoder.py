@@ -1,6 +1,5 @@
 """Byte pair encoding utilities"""
 
-import os
 import json
 import regex as re
 from functools import lru_cache
@@ -78,7 +77,7 @@ class Encoder:
                     j = word.index(first, i)
                     new_word.extend(word[i:j])
                     i = j
-                except:
+                except ValueError:
                     new_word.extend(word[i:])
                     break
 
@@ -115,7 +114,7 @@ class Encoder:
 
 
 def get_encoder():
-    with open('./GPT2/encoder.json', 'r') as f:
+    with open('./GPT2/encoder.json', 'r', encoding="utf-8") as f:
         encoder = json.load(f)
     with open('./GPT2/vocab.bpe', 'r', encoding="utf-8") as f:
         bpe_data = f.read()

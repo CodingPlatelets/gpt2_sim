@@ -1,7 +1,6 @@
+import struct
 import numpy as np
 from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
-import struct
-
 
 def bf16_to_float_block(bf16_block):
     # 左移16位填充为32位表示
@@ -23,7 +22,7 @@ class MACUnit:
         return len(self.state) > 0
     
     def get_input(self, a, b):
-        self.state = (a, b, True) 
+        self.state = (a, b, True)
 
     #def enqueue(self, a, b):
     def tick(self):
