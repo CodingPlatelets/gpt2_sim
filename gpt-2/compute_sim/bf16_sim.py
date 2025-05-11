@@ -1,6 +1,7 @@
 import random
 import struct
-
+import numpy as np
+import torch
 
 class FP32toBF16Pipeline:
     def __init__(self):
@@ -1039,9 +1040,6 @@ def test_bf16add():
     # 创建流水线实例
     pipeline = BF16AddPipeline()
 
-    import torch
-    import numpy as np
-
     # 将浮点数转换为BF16表示
     def float_to_bf16(value):
         # 将float转换为32位整数表示
@@ -1223,9 +1221,6 @@ def test_bf16multiply():
     # 创建流水线实例
     pipeline = BF16MultiplyPipeline()
 
-    import torch
-    import numpy as np
-
     # 将浮点数转换为BF16表示
     def float_to_bf16(value):
         # 将float转换为32位整数表示
@@ -1392,7 +1387,6 @@ def test_bf16multiply():
                 else:
                     print(f"  Sign check: Result should be +0.0")
                     print(f"  Correct sign: {not np.signbit(custom_result)}")
-
 
 # 测试模拟器
 if __name__ == "__main__":

@@ -236,7 +236,7 @@ class BF16:
                 mant_result >>= 1
                 exp_a += 1
 
-        while mant_result and not (mant_result & 0x80):  # 尾数不足，需要左移(隐藏位为0了)
+        while mant_result and not mant_result & 0x80:  # 尾数不足，需要左移(隐藏位为0了)
             mant_result <<= 1
             exp_a -= 1
 
