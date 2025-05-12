@@ -602,7 +602,7 @@ def get_values_offset_mask(matrix:csr_matrix):
         row_mask = 0
         
         for i in range(start, end):
-            col = col_indices[i]
+            col = int(col_indices[i])
             row_mask |= (1 << (num_cols - 1 - col))
         print(bin(row_mask))
         masks.append(row_mask)
@@ -661,15 +661,15 @@ if __name__ == "__main__":
     np.random.seed(42)  # 设定随机种子以便结果可复现
     #A3 = np.random.choice([0, 1], size=(1, 128), p=[0, 1])
     #B3 = np.random.choice([0, 1], size=(128, 4), p=[0.9, 0.1])
-    A3 = np.random.choice([0, 1], size=(1, 64), p=[0, 1])
-    B3 = np.random.choice([0, 1], size=(64, 4), p=[0.5, 0.5])
+    A3 = np.random.choice([0, 1], size=(1, 1024), p=[0, 1])
+    B3 = np.random.choice([0, 1], size=(1024, 432), p=[0.5, 0.5])
 
     expected3 = np.matmul(A3, B3)
     print(f"矩阵A:\n{A3}")
     print(f"矩阵B:\n{B3}")
     print(f"预期结果:\n{expected3}")
 
-    trapezoid3 = Trapezoid(4)
+    trapezoid3 = Trapezoid(128)
     trapezoid3.run(A3, B3)
     print((trapezoid3.mfiu.bit_width))
     print(f"Trapezoid结果:\n{trapezoid3.C_matrix}")
