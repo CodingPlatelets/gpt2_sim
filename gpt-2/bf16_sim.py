@@ -1,5 +1,5 @@
 import struct
-
+import random
 class FP32toBF16Pipeline:
     def __init__(self):
         """初始化流水线寄存器和状态"""
@@ -220,6 +220,8 @@ class BF16AddPipeline:
         self.stage4_exp_result = 0
         self.stage4_mant_result = 0
         
+        self.stage5_valid = False
+        
         # 常量定义
         self.POS_INF = 0x7F80  # 正无穷大：0 11111111 0000000
         self.NEG_INF = 0xFF80  # 负无穷大：1 11111111 0000000
@@ -291,6 +293,7 @@ class BF16AddPipeline:
         self.cycle_count += 1
         
         # 阶段4: 归一化和组合阶段 - 处理阶段3的输出
+        self.stage5_valid = self.stage4_valid
         if self.stage4_valid:
             result_bf16 = 0
             
@@ -489,7 +492,7 @@ class BF16AddPipeline:
         # 返回当前周期的状态
         return {
             "cycle": self.cycle_count,
-            "valid_output": self.stage4_valid,
+            "valid_output": self.stage5_valid,
             "pipeline_state": self.get_pipeline_state()
         }
     
@@ -552,7 +555,7 @@ class BF16AddPipeline:
         results = []
         
         # 确保输入列表足够长，不足部分用(0, 0, False)填充
-        extended_inputs = list(inputs) + [(0, 0, False)] * 3  # 加4个周期确保流水线清空
+        extended_inputs = list(inputs) + [(0, 0, False)] * 4  # 加4个周期确保流水线清空
         
         #print("cycle长度")
 
@@ -603,6 +606,8 @@ class BF16MultiplyPipeline:
         self.stage4_exp_result = 0
         self.stage4_mant_result = 0
         self.stage4_msb_pos = 0
+        
+        self.stage5_valid = False
         
         # 常量定义
         self.POS_INF = 0x7F80  # 正无穷大：0 11111111 0000000
@@ -668,6 +673,8 @@ class BF16MultiplyPipeline:
         self.cycle_count += 1
         
         # 阶段5: 输出阶段 - 处理阶段4的规范化和舍入结果
+        self.stage5_valid = self.stage4_valid
+        
         if self.stage4_valid:
             result_bf16 = 0
             
@@ -833,7 +840,7 @@ class BF16MultiplyPipeline:
         # 返回当前周期的状态
         return {
             "cycle": self.cycle_count,
-            "valid_output": self.stage4_valid,
+            "valid_output": self.stage5_valid,
             "pipeline_state": self.get_pipeline_state()
         }
     
@@ -911,7 +918,12 @@ class BF16MultiplyPipeline:
                 self.print_pipeline_state()
         
         return results
-    
+
+def convert_through_pipeline(value):
+        """通过完整流水线模拟转换FP32到BF16"""
+        temp_pipeline = FP32toBF16Pipeline()
+        temp_pipeline.run_simulation([(value, True)], print_states=False)
+        return temp_pipeline.outputs[0]["bf16"] if temp_pipeline.outputs else 0
 
 def test_fp32_to_bf16():
     # 创建流水线实例
@@ -942,6 +954,10 @@ def test_fp32_to_bf16():
         (data_3, True),
         (data_4, True)
     ]
+    for _ in range(10):
+        a = random.uniform(-10, 10)
+        test_data.append((a, True))
+    
     
     print("Starting FP32 to BF16 Pipeline Simulation")
     print("=" * 50)
@@ -982,6 +998,16 @@ def test_fp32_to_bf16():
             print(f"  Pipeline output:   {hex(pipeline_result)}")
             print(f"  Match: {direct_result == pipeline_result}")
             
+def bf16_add(bf16_a, bf16_b):
+    sim = BF16AddPipeline()
+    sim.run_simulation([(bf16_a, bf16_b, True)], False)
+    return sim.outputs[0]
+
+def bf16_mul(bf16_a, bf16_b):
+    sim = BF16MultiplyPipeline()
+    sim.run_simulation([(bf16_a, bf16_b, True)], False)
+    return sim.outputs[0]
+
 def test_bf16add():
     # 创建流水线实例
     pipeline = BF16AddPipeline()
@@ -1004,6 +1030,15 @@ def test_bf16add():
         # 转换为浮点数
         return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
     
+    def test_cases_bf16_to_float_add_to_bf16_to_float(test_cases):
+        results = []
+        for case in test_cases:
+            results.append(bf16_to_float(case[0]) + bf16_to_float(case[1]))
+        for i in range(len(results)):
+            results[i] = convert_through_pipeline(results[i])
+            results[i] = bf16_to_float(results[i])
+        return results
+    
     # 准备常规测试用例
     regular_cases = [
         (1.5, 2.25, True),        # 简单加法: 1.5 + 2.25 = 3.75
@@ -1015,6 +1050,11 @@ def test_bf16add():
         (0.1, 0.2, True),         # 小数: 0.1 + 0.2 = 0.3 (注意精度问题)
         (1.0, -1.0, True)         # 正好抵消: 1.0 + (-1.0) = 0.0
     ]
+
+    for _ in range(10):
+        a = random.uniform(-10, 10)
+        b = random.uniform(-10, 10)
+        regular_cases.append((a, b, True))
 
     subnormal_cases = [
         (1e-38, 1e-38, True),      # 极小数 + 极小数
@@ -1049,16 +1089,14 @@ def test_bf16add():
     # 合并所有测试用例
     test_cases = regular_cases + subnormal_cases + special_cases + [(0.0, 1.0, False)]
     
-    def convert_through_pipeline(value):
-        """通过完整流水线模拟转换FP32到BF16"""
-        temp_pipeline = FP32toBF16Pipeline()
-        temp_pipeline.run_simulation([(value, True)], print_states=False)
-        return temp_pipeline.outputs[0]["bf16"] if temp_pipeline.outputs else 0
+    
 
     # 转换测试用例为BF16格式
     bf16_test_cases = [(convert_through_pipeline(a), 
                         convert_through_pipeline(b), 
                         valid) for a, b, valid in test_cases]
+    
+    sim_cases = test_cases_bf16_to_float_add_to_bf16_to_float(bf16_test_cases)
     
     print("Starting BF16 Addition Pipeline Simulation")
     print("=" * 80)
@@ -1068,15 +1106,15 @@ def test_bf16add():
     
     print("=" * 80)
     print("Final Results:")
-    print("{:<5} {:<15} {:<15} {:<15} {:<20} {:<15} {:<15}".format(
-        "Test", "Input A", "Input B", "Expected Sum", "Custom BF16 Result", "PyTorch Result", "Error vs PyTorch"
+    print("{:<5} {:<15} {:<15} {:<15} {:<20} {:<15} {:<15} {:<15}".format(
+        "Test", "Input A", "Input B", "Expected Sum", "Custom BF16 Result", "PyTorch Result", "Error vs PyTorch", "Sim pytorch add"
     ))
     print("-" * 80)
     
     for i, output in enumerate(pipeline.outputs):
         if i < len(test_cases) and test_cases[i][2]:  # 只检查有效输入
             a, b, _ = test_cases[i]
-            
+            c = sim_cases[i]
             # 自定义实现的结果
             custom_result = bf16_to_float(output)
             
@@ -1103,14 +1141,15 @@ def test_bf16add():
             else:
                 expected = a + b
             
-            print("{:<5} {:<15} {:<15} {:<15} {:<20} {:<15} {:<15}".format(
+            print("{:<5} {:<15} {:<15} {:<15} {:<20} {:<15} {:<15} {:<15}".format(
                 i,
                 f"{a:.6g}",
                 f"{b:.6g}",
                 f"{expected:.6g}" if not np.isnan(expected) else "NaN",
                 f"{custom_result:.6g} ({hex(output)})" if not np.isnan(custom_result) else f"NaN ({hex(output)})",
                 f"{torch_sum:.6g}" if torch_sum != "N/A" else torch_sum,
-                f"{error:.6g}" if error != "N/A (Both NaN)" and error != "N/A (Both Inf)" and error != "N/A" else error
+                f"{error:.6g}" if error != "N/A (Both NaN)" and error != "N/A (Both Inf)" and error != "N/A" else error,
+                f"{c:.6g}"
             ))
     
     print("\nDetailed Analysis of Special Cases:")
@@ -1167,10 +1206,13 @@ def test_bf16multiply():
         fp32_bits = bf16 << 16
         # 转换为浮点数
         return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
+        
+            
     
     # 准备常规测试用例
     regular_cases = [
         (2.0, 3.0, True),        # 简单乘法: 2.0 * 3.0 = 6.0
+        (3.124, 2.249, True),
         (1.5, 2.25, True),       # 小数乘法: 1.5 * 2.25 = 3.375
         (3.14159, -1.5, True),   # 异号乘法: 3.14159 * (-1.5) ≈ -4.71
         (-3.0, -2.0, True),      # 负数乘法: (-3.0) * (-2.0) = 6.0
@@ -1179,6 +1221,11 @@ def test_bf16multiply():
         (1e-2, 1e2, True),       # 指数抵消: 0.01 * 100 = 1.0
         (0.1, 0.1, True)         # 小数平方: 0.1 * 0.1 = 0.01
     ]
+
+    for _ in range(10):
+        a = random.uniform(-10, 10)
+        b = random.uniform(-10, 10)
+        regular_cases.append((a, b, True))
 
     # 新增：下溢/非规格化测试用例
     subnormal_cases = [
@@ -1212,16 +1259,14 @@ def test_bf16multiply():
     # 合并所有测试用例
     test_cases = regular_cases + subnormal_cases + special_cases + [(0.0, 1.0, False)]
     
-    def convert_through_pipeline(value):
-        """通过完整流水线模拟转换FP32到BF16"""
-        temp_pipeline = FP32toBF16Pipeline()
-        temp_pipeline.run_simulation([(value, True)], print_states=False)
-        return temp_pipeline.outputs[0]["bf16"] if temp_pipeline.outputs else 0
+    
 
     # 转换测试用例为BF16格式
     bf16_test_cases = [(convert_through_pipeline(a), 
                         convert_through_pipeline(b), 
                         valid) for a, b, valid in test_cases]
+
+    
     
     print("Starting BF16 Multiplication Pipeline Simulation")
     print("=" * 80)
@@ -1321,9 +1366,3 @@ def test_bf16multiply():
 if __name__ == "__main__":
     #test_fp32_to_bf16()
     test_bf16add()
-    #test_bf16multiply()
-    #t = 0.0
-    #return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
-    #t_bits = struct.unpack('>I', struct.pack('>f', t))[0]
-    #t_bits_float = struct.unpack('>f', struct.pack('>I', t_bits | 0X1))
-    #print(t_bits_float)
