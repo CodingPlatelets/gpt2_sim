@@ -278,7 +278,8 @@ class AdvanceAddUnit:
         self.add = AddUnit()
 
     def get_input_and_merge(self, index_value_map_input1, index_value_map_input2):
-
+        
+        # stage1
         self.merge_index_value_map = index_value_map_input1.copy()
 
         for index, values in index_value_map_input2.items():
@@ -290,6 +291,8 @@ class AdvanceAddUnit:
         return self.merge_index_value_map
 
     def run(self):
+        
+        # stage2
         self.index_value_map_output = {}
         for evict_index in self.evict_index_queue:
             if evict_index in self.merge_index_value_map:
@@ -300,6 +303,7 @@ class AdvanceAddUnit:
                 if evict_index != -1:
                     self.c_values[m * self.N + n] += evict_val[0]
 
+        # stage3
         for index, values in self.merge_index_value_map.items():
             assert len(values) <= 2
             if len(values) == 2:
@@ -592,7 +596,6 @@ def get_values_offset_mask(matrix:csr_matrix):
     num_rows = len(row_ptr) - 1
     num_cols = matrix.shape[1]  
     
-    print(num_cols)
     # 创建每行的二进制掩码
     masks = []
     
@@ -604,7 +607,6 @@ def get_values_offset_mask(matrix:csr_matrix):
         for i in range(start, end):
             col = int(col_indices[i])
             row_mask |= (1 << (num_cols - 1 - col))
-        print(bin(row_mask))
         masks.append(row_mask)
     
     return values, row_ptr, masks
@@ -659,22 +661,22 @@ if __name__ == "__main__":
     print("\n===== 测试用例3：随机稀疏矩阵 =====")
     # 创建稀疏矩阵，只有20%的元素为1
     np.random.seed(42)  # 设定随机种子以便结果可复现
-    #A3 = np.random.choice([0, 1], size=(1, 128), p=[0, 1])
-    #B3 = np.random.choice([0, 1], size=(128, 4), p=[0.9, 0.1])
-    A3 = np.random.choice([0, 1], size=(1, 1024), p=[0, 1])
-    B3 = np.random.choice([0, 1], size=(1024, 432), p=[0.5, 0.5])
+    A3 = np.random.choice([0, 1], size=(1, 64), p=[0, 1])
+    B3 = np.random.choice([0, 1], size=(64, 10), p=[0.9, 0.1])
+    #A3 = np.random.choice([0, 1], size=(1, 1024), p=[0, 1])
+    #B3 = np.random.choice([0, 1], size=(1024, 432), p=[0.5, 0.5])
 
     expected3 = np.matmul(A3, B3)
     print(f"矩阵A:\n{A3}")
     print(f"矩阵B:\n{B3}")
     print(f"预期结果:\n{expected3}")
 
-    trapezoid3 = Trapezoid(128)
+    trapezoid3 = Trapezoid(4)
     trapezoid3.run(A3, B3)
     print((trapezoid3.mfiu.bit_width))
     print(f"Trapezoid结果:\n{trapezoid3.C_matrix}")
     print(f"结果正确: {np.array_equal(expected3, trapezoid3.C_matrix)}")
-    #trapezoid3.print_status()
+    trapezoid3.print_status()
 
     # 测试用例4：单位矩阵
     #print("\n===== 测试用例4：单位矩阵 =====")

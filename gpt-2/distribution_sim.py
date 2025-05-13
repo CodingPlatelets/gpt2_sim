@@ -1,9 +1,15 @@
 import numpy as np
 import math
+import struct
 from scipy.sparse import csr_matrix
 from distribution import get_values_offset_mask
 from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
 
+def convert_through_pipeline(value):
+    """通过完整流水线模拟转换FP32到BF16"""
+    temp_pipeline = FP32toBF16Pipeline()
+    temp_pipeline.run_simulation([(value, True)], print_states=False)
+    return temp_pipeline.outputs[0]["bf16"] if temp_pipeline.outputs else 0   
 
 def min_bits_needed(bit_width):
     if bit_width <= 0:
@@ -11,60 +17,11 @@ def min_bits_needed(bit_width):
     return math.ceil(math.log2(bit_width))
 
 
-class MulUnit:
-    """乘法单元，执行值的乘法操作"""
-
-    def __init__(self):
-        self.sft_index = None
-        self.val_a = None
-        self.val_b = None
-
-    def get_val_a(self, val_a):
-        """设置输入值A"""
-        self.val_a = val_a
-
-    def get_val_b(self, val_b):
-        """设置输入值B"""
-        self.val_b = val_b
-
-    def get_sft_index(self, sft_index):
-        """设置移位索引"""
-        self.sft_index = sft_index
-
-    def run(self):
-        """执行乘法运算"""
-        return self.val_a * self.val_b
-
-    def print_status(self):
-        """打印乘法单元当前状态"""
-        print("\n==== MulUnit 状态 ====")
-        print(f"Shift Index: {self.sft_index}")
-        print(f"Value A: {self.val_a}")
-        print(f"Value B: {self.val_b}")
-        print("======================")
-
-
-class AddUnit:
-    """加法单元，执行值的加法操作"""
-
-    def __init__(self):
-        self.sft_index_1 = None
-        self.sft_index_2 = None
-        self.val_1 = None
-        self.val_2 = None
-
-    def get(self, val_1, val_2, sft_index_1, sft_index_2):
-        """设置输入值和索引"""
-        self.sft_index_1 = sft_index_1
-        self.sft_index_2 = sft_index_2
-        self.val_1 = val_1
-        self.val_2 = val_2
-
-    def run(self):
-        """执行加法运算，如果索引相同则返回和值和第一个索引，否则返回None和两个索引"""
-        if self.sft_index_1 == self.sft_index_2 and self.sft_index_1 != -1:
-            return self.val_1 + self.val_2, self.sft_index_1
-        return None, self.sft_index_1, self.sft_index_2
+def bf16_to_float(bf16):
+    # 左移16位填充为32位表示
+    fp32_bits = bf16 << 16
+    # 转换为浮点数
+    return struct.unpack(">f", struct.pack(">I", fp32_bits))[0]
 
 
 class ShiftUnitPipeline:
@@ -787,116 +744,365 @@ class AddUnit:
         self.add_pipeline = BF16AddPipeline()
         self.input1 = 0
         self.input2 = 0
-        self.sft_index_1 = -1
-        self.sft_index_2 = -1
-        self.valid = False
+        self.index_queue = []  # 只有相同的index才能被送入加法单元
+        self.valid = False 
         self.input_valid = False
 
-    def get_input(self, input_valid, input1, input2, sft_index_1, sft_index_2):
+    def get_input(self, input_valid, input1, input2, sft_index):
         self.input1 = input1
         self.input2 = input2
         self.input_valid = input_valid
-        self.sft_index_1 = sft_index_1
-        self.sft_index_2 = sft_index_2
-
+        if input_valid: #防止污染数据
+            self.index_queue.append(sft_index) # 存放至sft_index队列中 
+    
     def clock_cycle(self):
         result = self.add_pipeline.clock_cycle(self.input1, self.input2, self.input_valid) 
         self.valid = result["valid_output"]
         if self.valid:
-            if self.sft_index_1 == self.sft_index_2:
-                return self.add_pipeline.outputs.pop(0), self.sft_index_1
-            return None, self.sft_index_1, self.sft_index_2
+            return self.add_pipeline.outputs.pop(0)
         return None
+    
+    def is_active(self):
+        return self.add_pipeline.is_active()
 
 
-class DoubleLayerAddUnit:
-    def __init__(self, width, M, N, c_values):
-        self.add_lower = [AddUnit(), AddUnit()]
-        self.add_upper = AddUnit()
-        self.width = width
+class AdvanceAddUnit:
+    def __init__(self, c_values, M, N):
+
+        self.cycle_count = 0
+
+        self.c_values = c_values
         self.M = M
         self.N = N
+        self.add = AddUnit()
 
+        self.direct_value_index_map_queue = []
+
+        # stage1 get input and merge
         self.stage1_valid = False
+        self.stage1_merge_index_value_map = {}
+        self.stage1_evict_index_queue = []
+
+        # stage2 evict values
         self.stage2_valid = False
+        self.stage2_merge_index_value_map = {}
 
-        # TODO: remember to empty
-        self.index_value_map = [[] for _ in range(width)]
-        self.add_lower_value_queue = []
-        self.add_lower_index_queue = []
-        
-        self.output_value_queue = []
-        self.output_index_queue = []
-        
-        self.c_values = c_values # TODO: 后面需要更细致地处理这个C块加法逻辑
+        # stage3 add
+        self.stage3_valid = False
+        self.output = {}
 
-    def add_lower_clock_cycle(self, input_valid, value_input, sft_index):
-        valid = False
-        for i, add in enumerate(self.add_lower):
-            idx = i * 2
-            add.get_input(input_valid, value_input[idx], value_input[idx + 1], sft_index[idx], sft_index[idx + 1])
-            result = add.clock_cycle()
-            if result is None:
-                self.add_lower_value_queue = []
-                self.add_lower_index_queue = []
-                self.index_value_map = [[] for _ in range(self.width)]
-            else:
-                if result[0] is None:
-                    self.add_lower_index_queue.append(result[1])
-                    self.add_lower_index_queue.append(result[2])
-                    self.add_lower_value_queue.append(add.input1)
-                    self.add_lower_value_queue.append(add.input2)
-                else:
-                    self.add_lower_index_queue.append(result[1])
-                    self.add_lower_value_queue.append(result[0])
-                valid = True    
-        for i, index in enumerate(self.add_lower_index_queue):
-            if index != -1:
-                self.index_value_map[index].append(self.add_lower_value_queue[i])
-        return valid
+    def clock_cycle(
+        self, valid, index_value_map_input1, index_value_map_input2, evict_index_queue):
         
-    def add_upper_clock_cycle(self, input_valid):
-        
-        if input_valid == False:
-            return False
-        
-        valid = False
-        flag = False
-        for index, values in enumerate(self.index_value_map):
-            m = index % self.M 
-            n = int(index / self.M)
+        self.cycle_count += 1
+        # stage3
+
+        ## 对于一个add单元，它的输入index队列可能会有以下5种情况
+        ## 1. None  2. AAB  3. AB  4. A  5. AA
+        ## 无论是否用到加法器，我们都需要等待加法器的周期以保证同步
+        ## 同时我们的output需要收集经过加法器和未经过加法器的index value对
+        ## 我们在add.valid = True 时需要同时弹出之前保存的index 和 index value对
+        ## 有两个queue 一个是 index queue 一个是 index value map queue
+        ## 其中AAB情况下 这两个queue可以同步弹出
+        ## 但在None AA A AB情况下，如果同步弹出出必定会导致有一个queue是没有的
+        ## 所以需要在None AB A AA的情况下padding 用index=-2进行padding
+
+         
+        self.output = {}
+        temp = {}
+        add_used = False
+        no_add_used = False
+
+        case_AA = False
+        case_AB_A = False
+        case_AAB = False
+        case_None = False
+
+        # case None
+        case_None = len(self.stage1_merge_index_value_map) == 0 
+        if case_None:
+            self.add.get_input(self.stage2_valid, 0, 0, -1) #也会包含stage2_valid=false的情况
+
+        for _, values in self.stage2_merge_index_value_map.items():
             if len(values) == 2:
-                self.add_upper.get_input(input_valid ,values[0], values[1], index, index)
-                result = self.add_upper.clock_cycle()
-                flag = True
-                if result is None:
-                    self.output_value_queue = []
-                    self.output_index_queue = []
+                add_used = True
+            if len(values) == 1:
+                no_add_used = True
+
+        case_AA = (add_used) and (no_add_used == False)
+        case_AB_A = (add_used == False) and (no_add_used)
+        case_AAB = add_used and no_add_used
+        for index, values in self.stage2_merge_index_value_map.items():
+            assert len(values) <= 2
+            if len(values) == 2:
+                self.add.get_input(self.stage2_valid, values[0], values[1], index)
+            elif len(values) == 1:
+                if index not in temp:
+                    temp[index] = []
+                temp[index].append(values[0])#
+                self.direct_value_index_map_queue.append(temp)
+        # padding
+        if self.stage2_valid:
+            if case_AA or case_None:
+                padding = {-2 : []}
+                self.direct_value_index_map_queue.append(padding)
+            elif case_AB_A:
+                self.add.get_input(self.stage2_valid, 0, 0, -2)
+            elif case_AAB:
+                pass # do nothing
+
+        result = self.add.clock_cycle()
+        self.stage3_valid = self.add.valid
+        if self.add.valid:
+            index = self.add.index_queue.pop(0)
+            index_value_map = self.direct_value_index_map_queue.pop(0)
+            if index != -2:
+                if index not in self.output:
+                    self.output[index] = []
+                self.output[index].append(result)
+            if -2 not in index_value_map.keys():
+                for index_s, values in index_value_map.items():
+                    assert len(values) == 1
+                    if index_s not in self.output:
+                        self.output[index_s] = []
+                    self.output[index_s].append(values[0])
+        else:
+            self.output = {}
+
+        # stage2 evict values
+        self.stage2_valid = self.stage1_valid
+        self.stage2_merge_index_value_map = self.stage1_merge_index_value_map
+        if self.stage1_valid:
+            for evict_index in self.stage1_evict_index_queue:
+                if evict_index in self.stage1_merge_index_value_map:
+                    m = evict_index % self.M
+                    n = int(evict_index / self.M)
+                    assert len(self.stage1_merge_index_value_map[evict_index]) == 1
+                    evict_val = self.stage1_merge_index_value_map.pop(evict_index)  # 获取列表中的值
+                    if evict_index != -1:
+                        self.c_values[m * self.N + n] += evict_val[0]
+
+        # stage1
+        self.stage1_valid = valid
+        if valid:
+            self.stage1_merge_index_value_map = index_value_map_input1.copy()
+
+            for index, values in index_value_map_input2.items():
+                if index in self.stage1_merge_index_value_map:
+                    self.stage1_merge_index_value_map[index].extend(values)
                 else:
-                    self.output_value_queue.append(result[0])
-                    self.output_index_queue.append(result[1])
-                    valid = True
-            elif len(values) == 1:            
-                self.c_values[m * self.N + n] += values[0] #TODO: 目前简化了这个逻辑，未来需要处理下 
-        if flag == False: #如果没有用到这个加法器，我们需要等待几个周期，以同步
-            self.add_upper.get_input(True, 0, 0, 0 ,0)
-            result = self.add_upper.clock_cycle()
-            if result is not None:
-                valid = True
-        return valid
-    
-    def clock_cycle(self, valid, value_input, sft_index):
-        
-        self.stage2_valid = self.add_upper_clock_cycle(self.stage1_valid)
-        self.stage1_valid = self.add_lower_clock_cycle(valid, value_input, sft_index)
-        
+                    self.stage1_merge_index_value_map[index] = values.copy()
+
+            self.stage1_evict_index_queue = evict_index_queue
+        else:
+            self.stage1_evict_index_queue = []
+            self.stage1_merge_index_value_map = {}
+
         return {
-            "valid": self.stage2_valid,
-            "output_value_queue": self.output_value_queue if self.stage2_valid else [],
-            "output_index_queue":
+            "cycle": self.cycle_count,
+            "valid": self.stage3_valid,
+            "output": self.output if self.stage3_valid else None,
+            "pipeline_state": self.get_pipeline_state(),
         }
         
+    def reset(self):
+        """重置流水线状态"""
+        self.cycle_count = 0
         
+        # 重置队列
+        self.direct_value_index_map_queue = []
+        
+        # 重置第一阶段
+        self.stage1_valid = False
+        self.stage1_merge_index_value_map = {}
+        self.stage1_evict_index_queue = []
+        
+        # 重置第二阶段
+        self.stage2_valid = False
+        self.stage2_merge_index_value_map = {}
+        
+        # 重置第三阶段
+        self.stage3_valid = False
+        self.output = {}
+        
+        # 重置加法单元
+        self.add = AddUnit()
+
+    def get_pipeline_state(self):
+        """获取流水线的当前状态"""
+        return {
+            "cycle_count": self.cycle_count,
+            "stage1": {
+                "valid": self.stage1_valid,
+                "merge_index_value_map": self.stage1_merge_index_value_map,
+                "evict_index_queue": self.stage1_evict_index_queue
+            },
+            "stage2": {
+                "valid": self.stage2_valid,
+                "merge_index_value_map": self.stage2_merge_index_value_map
+            },
+            "stage3": {
+                "valid": self.stage3_valid,
+                "output": self.output
+            },
+            "add_unit": {
+                "valid": self.add.valid if hasattr(self.add, 'valid') else False,
+                "index_queue": self.add.index_queue if hasattr(self.add, 'index_queue') else []
+            },
+            "direct_value_index_map_queue": self.direct_value_index_map_queue
+        }
+
+    def print_state(self):
+        """打印流水线的当前状态"""
+        state = self.get_pipeline_state()
+        
+        print("\n==== AdvanceAddUnit 状态 (周期 {}) ====".format(state["cycle_count"]))
+        
+        # 打印阶段1状态
+        print("\n[阶段1] 合并输入:")
+        print("  有效: {}".format(state["stage1"]["valid"]))
+        if state["stage1"]["valid"]:
+            print("  合并索引-值映射:")
+            for index, values in state["stage1"]["merge_index_value_map"].items():
+                print(f"    索引 {index}: 值 {values}")
+            print("  驱逐索引队列: {}".format(state["stage1"]["evict_index_queue"]))
+        
+        # 打印阶段2状态
+        print("\n[阶段2] 驱逐值:")
+        print("  有效: {}".format(state["stage2"]["valid"]))
+        if state["stage2"]["valid"]:
+            print("  合并索引-值映射:")
+            for index, values in state["stage2"]["merge_index_value_map"].items():
+                print(f"    索引 {index}: 值 {values}")
+        
+        # 打印阶段3状态
+        print("\n[阶段3] 加法运算:")
+        print("  有效: {}".format(state["stage3"]["valid"]))
+        if state["stage3"]["valid"]:
+            print("  输出:")
+            for index, values in state["stage3"]["output"].items():
+                print(f"    索引 {index}: 值 {values}")
+        
+        # 打印加法单元状态
+        print("\n[加法单元]:")
+        print("  有效: {}".format(state["add_unit"]["valid"]))
+        print("  索引队列: {}".format(state["add_unit"]["index_queue"]))
+        
+        # 打印直接值索引映射队列
+        print("\n[直接值索引映射队列]:")
+        for idx, item in enumerate(state["direct_value_index_map_queue"]):
+            print(f"  项目 {idx}: {item}")
+        
+        print("\n====================================")
+    
+    def run_pipeline(self, input_maps_pairs, evict_indices=None, max_cycles=20, print_states=False):
+        """
+        运行整个AdvanceAddUnit流水线，处理一系列输入并返回结果
+        
+        Args:
+            input_maps_pairs: 列表，每个元素是(map1, map2)元组，表示每个时钟周期的两个输入映射
+            evict_indices: 列表，每个元素是要驱逐的索引列表，对应每个输入对
+            max_cycles: 最大运行周期数，防止无限循环
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            results: 包含每个时钟周期输出的列表
+        """
+        # 重置流水线状态
+        self.reset()
+        
+        # 初始化结果列表
+        results = []
+        
+        # 如果没有提供驱逐索引，则使用空列表
+        if evict_indices is None:
+            evict_indices = [[] for _ in range(len(input_maps_pairs))]
+        
+        # 确保evict_indices长度匹配input_maps_pairs
+        assert len(evict_indices) >= len(input_maps_pairs), "驱逐索引列表长度应不小于输入对列表长度"
+        
+        # 创建输入队列
+        input_queue = list(zip(input_maps_pairs, evict_indices))
+        input_idx = 0
+        
+        # 运行流水线，直到处理完所有输入并且没有更多有效数据
+        cycle = 0
+        while (input_idx < len(input_queue) or 
+            self.is_active()) and cycle < max_cycles:
+            
+            # 获取当前周期的输入，如果有的话
+            if input_idx < len(input_queue):
+                (map1, map2), evict_list = input_queue[input_idx]
+                valid = True
+                input_idx += 1
+            else:
+                map1, map2, evict_list = {}, {}, []
+                valid = False
+            
+            # 运行一个时钟周期
+            result = self.clock_cycle(valid, map1, map2, evict_list)
+            results.append(result)
+            
+            # 如果需要，打印当前状态
+            if print_states:
+                print(f"\n--- 周期 {cycle + 1} ---")
+                self.print_state()
+            
+            cycle += 1
+        
+        # 检查是否因为达到最大周期数而退出
+        if cycle >= max_cycles and (input_idx < len(input_queue) or 
+                                self.stage1_valid or self.stage2_valid or self.stage3_valid):
+            print(f"警告: 达到最大周期数 {max_cycles}，流水线可能未完全排空")
+        
+        return results
+    
+    def run_pipeline_with_bf16(self, input_maps_pairs, evict_indices=None, max_cycles=20, print_states=False):
+        """
+        运行流水线，自动将输入值转换为BF16格式
+        
+        Args:
+            input_maps_pairs: 列表，每个元素是(map1, map2)元组，表示每个时钟周期的两个输入映射
+            evict_indices: 列表，每个元素是要驱逐的索引列表
+            max_cycles: 最大运行周期数
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            results: 包含每个时钟周期输出的列表
+        """
+        # 转换所有输入值为BF16格式
+        converted_input_pairs = []
+        
+        for map1, map2 in input_maps_pairs:
+            # 转换第一个映射
+            converted_map1 = {}
+            for index, values in map1.items():
+                converted_values = [convert_through_pipeline(float(val)) for val in values]
+                converted_map1[index] = converted_values
+            
+            # 转换第二个映射
+            converted_map2 = {}
+            for index, values in map2.items():
+                converted_values = [convert_through_pipeline(float(val)) for val in values]
+                converted_map2[index] = converted_values
+            
+            # 添加到转换后的列表
+            converted_input_pairs.append((converted_map1, converted_map2))
+        
+        # 使用转换后的输入运行流水线
+        return self.run_pipeline(converted_input_pairs, evict_indices, max_cycles, print_states)
+
+    def is_active(self):
+        """
+        检查流水线是否仍在处理数据
+        
+        Returns:
+            bool: 如果流水线中还有活跃的数据则返回True
+        """
+        return (self.stage1_valid or 
+                self.stage2_valid or 
+                self.stage3_valid or
+                self.add.is_active())
 
 
 class TrapezoidPipeline:
@@ -1025,7 +1231,7 @@ class TrapezoidPipeline:
 
 
 # 测试代码
-def run_tests(A: np.array, B: np.array):
+def test_MFIU_unit(A: np.array, B: np.array):
     print("\n===== 测试 MFIU Pipeline =====")
     csr_A = csr_matrix(A)
     csr_B = csr_matrix(B.T)
@@ -1048,11 +1254,54 @@ def run_tests(A: np.array, B: np.array):
     print(results["output_a"])
     print(results["output_b"])
 
-
-if __name__ == "__main__":
+def test_MFIU():
     # 运行测试
     print("\n===== 测试用例1：简单矩阵 =====")
     A1 = np.array([[1, 0, 1, 0], [0, 1, 1, 0]])
 
     B1 = np.array([[1, 1], [0, 0], [0, 1], [1, 0]])
-    run_tests(A1, B1)
+    test_MFIU_unit(A1, B1)
+    
+    np.random.seed(42)
+    A3 = np.random.choice([0, 1], size=(1, 64), p=[0, 1])
+    B3 = np.random.choice([0, 1], size=(64, 10), p=[0.9, 0.1])
+    test_MFIU_unit(A3, B3)
+
+def AdvanceAdd_output_to_float(output:dict):
+    new_output = {}
+    for key, values in output.items():
+        temp = [bf16_to_float(v) for v in values]
+        new_output[key] = temp
+    return new_output
+    
+
+def test_AdvanceAdd():
+    # 示例用法
+    adder = AdvanceAddUnit(c_values=[0]*4, M=2, N=2)
+
+    # 准备输入数据
+    input_pairs = [
+        ({0: [5], -1: [5]}, {-1: [3]}),           # 周期1: 合并得到 {1: [5, 3]}
+        ({2: [4]}, {3: [7]}),           # 周期2: {2: [4]}, {3: [7]}
+        ({}, {})                        # 周期3: 空输入
+    ]
+
+    evict_indices = [
+        [],                           # 周期1: 驱逐索引1
+        [3],                           # 周期2: 驱逐索引2
+        []                             # 周期3: 无驱逐
+    ]
+
+    # 运行流水线
+    results = adder.run_pipeline_with_bf16(input_pairs, evict_indices, print_states=True)
+
+    # 检查结果
+    for i, res in enumerate(results):
+        if res["valid"]:
+            print(f"周期 {i+1} 输出: {AdvanceAdd_output_to_float(res['output'])}") 
+    c_values_float = [bf16_to_float(c) for c in adder.c_values]
+    print(c_values_float)
+
+if __name__ == "__main__":
+    #test_MFIU()
+    test_AdvanceAdd()
