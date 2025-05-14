@@ -4,6 +4,7 @@ import struct
 from scipy.sparse import csr_matrix
 from distribution import get_values_offset_mask
 from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
+from collections import Counter
 
 def convert_through_pipeline(value):
     """通过完整流水线模拟转换FP32到BF16"""
@@ -22,6 +23,13 @@ def bf16_to_float(bf16):
     fp32_bits = bf16 << 16
     # 转换为浮点数
     return struct.unpack(">f", struct.pack(">I", fp32_bits))[0]
+
+def find_singles(lst):
+    # 统计每个元素出现的次数
+    counts = Counter(lst)
+    # 返回只出现一次的元素
+    return [item for item, count in counts.items() if count == 1]
+
 
 
 class ShiftUnitPipeline:
@@ -1106,25 +1114,78 @@ class AdvanceAddUnit:
 
 class AddTree:
     def __init__(self, PE_num, c_values, M, N):
+        self.cycle_count = 0
+        
         self.PE_num = PE_num
         self.c_values = c_values
         self.M = M
         self.N = N
-        self.tree = self.create_tree()
+        self.tree = self.create_tree() 
         
+        self.stage_valid_vec = [False] * (self.tree_levels + 1)
+        self.stage_output_vec = [[] for _ in range(self.tree_levels + 1)] 
+        self.stage_evict_vec = [[] for _ in range(self.tree_levels)]
         
-
     def create_tree(self):
-        tree_levels = int(math.log2(self.PE_num))
+        self.tree_levels = int(math.log2(self.PE_num))
         tree = []
         level_size = self.PE_num // 2
-        for _ in range(0, tree_levels):
+        for _ in range(0, self.tree_levels):
             tree.append(
                 [AdvanceAddUnit(self.c_values, self.M, self.N) for _ in range(level_size)]
             )
             level_size = level_size // 2
-        tree.reverse()
+        #tree.reverse()
         return tree
+    
+    def get_level_evict_index(self, map_queue):
+        merge_index = []
+        for m in map_queue:
+            for index, _ in m.items():
+                merge_index.append(index)
+        evict_index = find_singles(merge_index)
+        return evict_index
+    
+    def clock_cycle(self, valid, map_queue):
+        
+        # add.clock_cycle(self, valid, index_value_map_input1, index_value_map_input2, evict_index_queue):
+        # return {
+        #    "cycle": self.cycle_count,
+        #    "valid": self.stage3_valid,
+        #    "output": self.output if self.stage3_valid else None,
+        #    "pipeline_state": self.get_pipeline_state(),
+        #}
+        self.cycle_count += 1
+        for i in range(self.tree_levels - 1):
+            pass
+        
+        for i in range(self.tree_levels - 1 , 0, -1):
+            add_layer_valid = False
+            for add in self.tree[i]:
+                result = add.clock_cycle(
+                self.stage_valid_vec[i - 1], 
+                self.stage_output_vec[i - 1].pop(0) if self.stage_valid_vec[i - 1] else [],
+                self.stage_output_vec[i - 1].pop(0) if self.stage_valid_vec[i - 1] else [],
+                self.stage_evict_vec[i - 1]
+                )
+                if result["valid"]:
+                    self.stage_output_vec[i].append(result["output"])
+                    add_layer_valid = result["valid"]
+            if add_layer_valid:
+                self.stage_evict_vec[i] = self.get_level_evict_index(self.stage_output_vec[i])
+            else:
+                self.stage_evict_vec[i] = []
+                self.stage_output_vec[i] = []
+        
+        self.stage_valid_vec[0] = valid
+        if valid:
+            self.stage_output_vec[0] = map_queue.copy()
+            self.stage_evict_vec[0] = self.get_level_evict_index(self.stage_output_vec[0])
+        else:
+            self.stage_evict_vec[0] = []
+            self.stage_output_vec[0] = []
+                        
+        
 
 class TrapezoidPipeline:
     def __init__(self, M, K, N, PE_num=4):
