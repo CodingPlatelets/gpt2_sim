@@ -1104,6 +1104,27 @@ class AdvanceAddUnit:
                 self.stage3_valid or
                 self.add.is_active())
 
+class AddTree:
+    def __init__(self, PE_num, c_values, M, N):
+        self.PE_num = PE_num
+        self.c_values = c_values
+        self.M = M
+        self.N = N
+        self.tree = self.create_tree()
+        
+        
+
+    def create_tree(self):
+        tree_levels = int(math.log2(self.PE_num))
+        tree = []
+        level_size = self.PE_num // 2
+        for _ in range(0, tree_levels):
+            tree.append(
+                [AdvanceAddUnit(self.c_values, self.M, self.N) for _ in range(level_size)]
+            )
+            level_size = level_size // 2
+        tree.reverse()
+        return tree
 
 class TrapezoidPipeline:
     def __init__(self, M, K, N, PE_num=4):
@@ -1273,7 +1294,7 @@ def AdvanceAdd_output_to_float(output:dict):
         temp = [bf16_to_float(v) for v in values]
         new_output[key] = temp
     return new_output
-    
+
 
 def test_AdvanceAdd():
     # 示例用法
