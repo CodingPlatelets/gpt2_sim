@@ -214,7 +214,7 @@ class SparseMatrixPipeline:
         for pe in self.pes:
             pe.reset_accumulator()
         
-        if self.B is not None:
+        if hasattr(self, 'B') and self.B is not None:
             self.result = np.zeros((self.A.shape[0], self.B.shape[1]))
         
         self.result_ready = False
@@ -237,10 +237,7 @@ class SparseMatrixPipeline:
         )
     
     def clock_cycle(self):
-        """
-        整个稀疏矩阵乘法分为：
-        
-        """
+        """执行一个时钟周期的模拟"""
         # 第1阶段: 处理PE的计算
         for pe in self.pes:
             pe.clock_cycle()
@@ -275,13 +272,10 @@ class SparseMatrixPipeline:
         self.reset()
         
         while self.clock < max_cycles:
-
-            # if self.clock % 100 == 0 or self.clock == 0:
-            queue_lengths = self.distribution_network.get_queue_lengths()
-            busy_pes = sum(1 for pe in self.pes if pe.is_busy())
-            # logger.info(f"周期 {self.clock}: 队列长度={queue_lengths}, 活跃PE={busy_pes}") 
-            logger.info(f"周期 {self.clock}: 最大有效队列长度={max(queue_lengths)}, 活跃PE={busy_pes}") 
-
+            if self.clock % 100 == 0 or self.clock == 0:
+                queue_lengths = self.distribution_network.get_queue_lengths()
+                busy_pes = sum(1 for pe in self.pes if pe.is_busy())
+                logger.info(f"周期 {self.clock}: 最大有效队列长度={max(queue_lengths)}, 活跃PE={busy_pes}") 
 
             if self.clock_cycle():
                 logger.info(f"模拟完成，共用时 {self.clock} 个时钟周期")
@@ -334,24 +328,113 @@ class SparseMatrixPipeline:
             logger.debug(f"模拟结果:\n{self.result}")
             logger.debug(f"参考结果:\n{self.reference_result}")
             return False
+            
+    def run_large_matrix_multiplication(self, a_rows=1, a_cols=4096, b_rows=4096, b_cols=4096, 
+                                      sparsity=0.8, block_size=128, seed=42):
+        """
+        通过分块方式处理大规模矩阵乘法
+        
+        参数:
+            a_rows, a_cols: A矩阵的维度 (1x4096)
+            b_rows, b_cols: B矩阵的维度 (4096x4096)
+            sparsity: B矩阵的稀疏度
+            block_size: 列块大小，应与PE数量匹配
+            seed: 随机种子
+        """
+        logger.info(f"开始大规模矩阵乘法 ({a_rows}x{a_cols}) * ({b_rows}x{b_cols})")
+        
+        # 生成完整的A矩阵 (1x4096)
+        np.random.seed(seed)
+        self.A = np.random.rand(a_rows, a_cols)
+        
+        # 创建完整的参考B矩阵用于验证
+        dense_B_full = np.random.rand(b_rows, b_cols)
+        mask = np.random.rand(b_rows, b_cols) < sparsity
+        self.B_dense_full = np.where(mask, 0, dense_B_full)
+        
+        # 使用NumPy计算参考结果
+        self.reference_result = np.matmul(self.A, self.B_dense_full)
+        
+        # 计算需要的列块数量
+        num_blocks = b_cols // block_size
+        if b_cols % block_size != 0:
+            num_blocks += 1
+        
+        # 初始化全局结果矩阵（只创建一次）
+        global_result = np.zeros((a_rows, b_cols))
+        
+        # 迭代处理每个列块
+        total_cycles = 0
+        for block in range(num_blocks):
+            # 计算当前块的列范围
+            start_col = block * block_size
+            end_col = min((block + 1) * block_size, b_cols)
+            actual_block_size = end_col - start_col
+            
+            logger.info(f"处理列块 {block+1}/{num_blocks}: 列 {start_col} 到 {end_col-1}")
+            
+            # 提取当前块的B矩阵 (b_rows x actual_block_size)
+            B_block = self.B_dense_full[:, start_col:end_col]
+            
+            # 重置PE状态
+            for pe in self.pes:
+                pe.reset_accumulator()
+            
+            # 重置模拟器状态
+            self.clock = 0
+            self.result_ready = False
+            
+            # 将B矩阵块转换为CSC格式
+            self.B = CSCMatrix.from_dense(B_block)
+            
+            # 为当前块创建一个块大小的结果矩阵
+            self.result = np.zeros((a_rows, actual_block_size))
+            
+            # 将矩阵加载到分发网络并运行模拟
+            self.distribution_network = DistributionNetwork(self.num_pes)
+            self.distribution_network.load_matrices(self.A, self.B)
+            self.run_simulation()
+            
+            # 将块结果复制到全局结果矩阵的对应位置
+            for col in range(actual_block_size):
+                global_col = start_col + col
+                global_result[0, global_col] = self.result[0, col]
+            
+            total_cycles += self.clock
+            logger.info(f"列块 {block+1} 完成，用时 {self.clock} 个周期")
+        
+        # 最后将全局结果设置为最终结果
+        self.result = global_result
+        
+        logger.info(f"大规模矩阵乘法完成，总用时 {total_cycles} 个周期")
+        return self.verify_result()
 
 def main():
     """主函数"""
+    PE_SIZE = 128
     # 创建模拟器
-    simulator = SparseMatrixPipeline(num_pes = 128)
-
-    # 加载矩阵
-    simulator.generate_matrices(a_rows=1, a_cols=128, b_rows=128, b_cols=128, sparsity=0.8)
-        
-    # 运行模拟
-    simulator.run_simulation()
+    simulator = SparseMatrixPipeline(num_pes = PE_SIZE)
+    
+    # 选择运行标准矩阵乘法或大规模矩阵乘法
+    use_large_matrix = True
+    
+    if use_large_matrix:
+        # 运行大规模矩阵乘法 (分块处理)
+        simulator.run_large_matrix_multiplication(
+            a_rows=1, a_cols=4096, b_rows=4096, b_cols=4096, 
+            sparsity=0.8, block_size=PE_SIZE)
+    else:
+        # 运行标准矩阵乘法
+        simulator.generate_matrices(a_rows=1, a_cols=128, b_rows=128, b_cols=128, sparsity=0.8)
+        simulator.run_simulation()
     
     # 验证结果
     simulator.verify_result()
     
-    # 打印结果和性能统计
-    logger.info(f"结果矩阵:\n{simulator.result}")
-    logger.info(f"总时钟周期: {simulator.clock}")
+    # 不打印整个结果矩阵，只显示部分样本
+    logger.info(f"结果矩阵样本（:\n{simulator.result[0, :10]}")
+    logger.info(f"预期结果样本:\n{simulator.reference_result[0, :10]}")
+    logger.info(f"最大误差: {np.max(np.abs(simulator.result - simulator.reference_result))}")
 
 if __name__ == "__main__":
     main()
