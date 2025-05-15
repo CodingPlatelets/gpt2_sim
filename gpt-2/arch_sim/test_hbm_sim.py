@@ -171,15 +171,15 @@ class TestHBMBuffer(unittest.TestCase):
 
         # 检查是否有完成的写入
         first_completed = self.buffer.check_completed_writes()
-        
+
         # 推进足够多的周期确保所有操作完成
         self.buffer.tick(100)
 
         # 再次检查
         second_completed = self.buffer.check_completed_writes()
-        
+
         # 两次检查的总和应该等于3
-        self.assertEqual(first_completed + second_completed, 3, 
+        self.assertEqual(first_completed + second_completed, 3,
                          f"两次完成的操作总数应为3，但得到{first_completed}+{second_completed}")
 
     def test_callback(self):
