@@ -1,10 +1,25 @@
 import numpy as np
 import math
 import struct
+import time
 from scipy.sparse import csr_matrix
 from distribution import get_values_offset_mask
 from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
 from collections import Counter
+
+
+def naive_matmul(A, B):
+    """使用朴素方法计算矩阵乘法，用于结果验证"""
+    M, K = A.shape
+    _, N = B.shape
+    C = np.zeros((M, N))
+    
+    for i in range(M):
+        for j in range(N):
+            for k in range(K):
+                C[i, j] += A[i, k] * B[k, j]
+    
+    return C
 
 def convert_through_pipeline(value):
     """通过完整流水线模拟转换FP32到BF16"""
@@ -29,7 +44,6 @@ def find_singles(lst):
     counts = Counter(lst)
     # 返回只出现一次的元素
     return [item for item, count in counts.items() if count == 1]
-
 
 
 class ShiftUnitPipeline:
@@ -192,6 +206,9 @@ class ShiftUnitPipeline:
             "output": self.output if self.stage4_valid else None,
             "pipeline_state": self.get_pipeline_state(),
         }
+        
+    def is_active(self):
+        return self.stage1_valid or self.stage2_valid or self.stage3_valid or self.stage4_valid
 
     def get_pipeline_state(self):
         """返回流水线当前状态"""
@@ -319,6 +336,7 @@ class MFIUPipeline:
         # stage1 处理输入，并进行一些预处理
 
         # 预处理结果
+        self.stage1_valid = False
         self.stage1_len_values_A = 0
         self.stage1_len_values_B = 0
         self.stage1_A_bit_mask_vec = [0] * self.width
@@ -399,8 +417,11 @@ class MFIUPipeline:
                 self.stage4_B_col_offset_vec[i],
             )
             self.stage5_valid = results_a["valid"]
-            self.output[0].append(results_a["output"])
-            self.output[1].append(results_b["output"])
+            if self.stage5_valid:
+                self.output[0].append(results_a["output"])
+                self.output[1].append(results_b["output"])
+            else:
+                self.output = ([], [])
 
         # stage4 get ec_idx
         self.stage4_valid = self.stage3_valid
@@ -479,6 +500,17 @@ class MFIUPipeline:
             "output": self.output if self.stage5_valid else None,
             "pipeline_state": self.get_pipeline_state(),
         }
+    
+    def is_active(self):
+        if self.stage1_valid or self.stage2_valid or self.stage3_valid or self.stage4_valid or self.stage5_valid:
+            return True
+        for shift in self.shift_unit_pipeline_vec_a:
+            if shift.is_active():
+                return True
+        for shift in self.shift_unit_pipeline_vec_b:
+            if shift.is_active():
+                return True
+        return False
 
     def reset(self):
         """重置流水线状态"""
@@ -729,14 +761,16 @@ class MACUnit:
         self.multiply_pipeline = BF16MultiplyPipeline()
         self.input1 = 0
         self.input2 = 0
-        self.output = 0
+        self.index_queue = []
         self.valid = False
         self.input_valid = False
 
-    def get_input(self, input1, input2, input_valid):
+    def get_input(self, input_valid, input1, input2, sft_index):
         self.input1 = input1
         self.input2 = input2
         self.input_valid = input_valid
+        if input_valid:
+            self.index_queue.append(sft_index)
 
     def clock_cycle(self):
         result = self.multiply_pipeline.clock_cycle(
@@ -744,8 +778,11 @@ class MACUnit:
         )
         self.valid = result["valid_output"]
         if self.valid:
-            self.output = self.multiply_pipeline.outputs.pop(0)
+            return self.multiply_pipeline.outputs.pop(0)
+        return None
 
+    def is_active(self):
+        return self.multiply_pipeline.is_active()
 
 class AddUnit:
     def __init__(self):
@@ -827,9 +864,9 @@ class AdvanceAddUnit:
         case_None = False
 
         # case None
-        case_None = len(self.stage1_merge_index_value_map) == 0 
+        case_None = len(self.stage2_merge_index_value_map) == 0 
         if case_None:
-            self.add.get_input(self.stage2_valid, 0, 0, -1) #也会包含stage2_valid=false的情况
+            self.add.get_input(self.stage2_valid, 0, 0, -2) #也会包含stage2_valid=false的情况
 
         for _, values in self.stage2_merge_index_value_map.items():
             if len(values) == 2:
@@ -847,8 +884,10 @@ class AdvanceAddUnit:
             elif len(values) == 1:
                 if index not in temp:
                     temp[index] = []
-                temp[index].append(values[0])#
-                self.direct_value_index_map_queue.append(temp)
+                temp[index].append(values[0])
+                #single_value_map = {index: [values[0]]}
+        if temp:  # 只有在temp非空时才添加
+            self.direct_value_index_map_queue.append(temp.copy())
         # padding
         if self.stage2_valid:
             if case_AA or case_None:
@@ -879,7 +918,7 @@ class AdvanceAddUnit:
 
         # stage2 evict values
         self.stage2_valid = self.stage1_valid
-        self.stage2_merge_index_value_map = self.stage1_merge_index_value_map
+        
         if self.stage1_valid:
             for evict_index in self.stage1_evict_index_queue:
                 if evict_index in self.stage1_merge_index_value_map:
@@ -889,6 +928,7 @@ class AdvanceAddUnit:
                     evict_val = self.stage1_merge_index_value_map.pop(evict_index)  # 获取列表中的值
                     if evict_index != -1:
                         self.c_values[m * self.N + n] += evict_val[0]
+        self.stage2_merge_index_value_map = self.stage1_merge_index_value_map.copy()
 
         # stage1
         self.stage1_valid = valid
@@ -1115,17 +1155,17 @@ class AdvanceAddUnit:
 class AddTree:
     def __init__(self, PE_num, c_values, M, N):
         self.cycle_count = 0
-        
+
         self.PE_num = PE_num
         self.c_values = c_values
         self.M = M
         self.N = N
         self.tree = self.create_tree() 
-        
+
         self.stage_valid_vec = [False] * (self.tree_levels + 1)
         self.stage_output_vec = [[] for _ in range(self.tree_levels + 1)] 
-        self.stage_evict_vec = [[] for _ in range(self.tree_levels)]
-        
+        self.stage_evict_vec = [[] for _ in range(self.tree_levels + 1)]
+
     def create_tree(self):
         self.tree_levels = int(math.log2(self.PE_num))
         tree = []
@@ -1135,9 +1175,9 @@ class AddTree:
                 [AdvanceAddUnit(self.c_values, self.M, self.N) for _ in range(level_size)]
             )
             level_size = level_size // 2
-        #tree.reverse()
+        # tree.reverse()
         return tree
-    
+
     def get_level_evict_index(self, map_queue):
         merge_index = []
         for m in map_queue:
@@ -1145,38 +1185,38 @@ class AddTree:
                 merge_index.append(index)
         evict_index = find_singles(merge_index)
         return evict_index
-    
+
     def clock_cycle(self, valid, map_queue):
-        
+
         # add.clock_cycle(self, valid, index_value_map_input1, index_value_map_input2, evict_index_queue):
         # return {
         #    "cycle": self.cycle_count,
         #    "valid": self.stage3_valid,
         #    "output": self.output if self.stage3_valid else None,
         #    "pipeline_state": self.get_pipeline_state(),
-        #}
+        # }
         self.cycle_count += 1
-        for i in range(self.tree_levels - 1):
-            pass
-        
-        for i in range(self.tree_levels - 1 , 0, -1):
+
+        for i in range(self.tree_levels - 1 , -1, -1):
             add_layer_valid = False
             for add in self.tree[i]:
                 result = add.clock_cycle(
-                self.stage_valid_vec[i - 1], 
-                self.stage_output_vec[i - 1].pop(0) if self.stage_valid_vec[i - 1] else [],
-                self.stage_output_vec[i - 1].pop(0) if self.stage_valid_vec[i - 1] else [],
-                self.stage_evict_vec[i - 1]
+                self.stage_valid_vec[i], 
+                self.stage_output_vec[i].pop(0) if self.stage_valid_vec[i] else [],
+                self.stage_output_vec[i].pop(0) if self.stage_valid_vec[i] else [],
+                self.stage_evict_vec[i]
                 )
                 if result["valid"]:
-                    self.stage_output_vec[i].append(result["output"])
+                    self.stage_output_vec[i + 1].append(result["output"])
                     add_layer_valid = result["valid"]
             if add_layer_valid:
-                self.stage_evict_vec[i] = self.get_level_evict_index(self.stage_output_vec[i])
+                self.stage_evict_vec[i + 1] = self.get_level_evict_index(self.stage_output_vec[i + 1])
+                self.stage_valid_vec[i + 1] = True
             else:
-                self.stage_evict_vec[i] = []
-                self.stage_output_vec[i] = []
-        
+                self.stage_evict_vec[i + 1] = []
+                self.stage_output_vec[i + 1] = []
+                self.stage_valid_vec[i + 1] = False
+
         self.stage_valid_vec[0] = valid
         if valid:
             self.stage_output_vec[0] = map_queue.copy()
@@ -1184,8 +1224,196 @@ class AddTree:
         else:
             self.stage_evict_vec[0] = []
             self.stage_output_vec[0] = []
-                        
+
+        return {
+            "cycle": self.cycle_count,
+            "valid": self.stage_valid_vec[-1],  # 最后阶段的有效标志
+            "output": self.stage_output_vec[-1] if self.stage_valid_vec[-1] else None,
+        }
+
+    def reset(self):
+        """重置加法树的所有状态"""
+        self.cycle_count = 0
+
+        # 重置所有阶段的有效标志
+        self.stage_valid_vec = [False] * (self.tree_levels + 1)
+
+        # 重置输出和驱逐索引向量
+        self.stage_output_vec = [[] for _ in range(self.tree_levels + 1)]
+        self.stage_evict_vec = [[] for _ in range(self.tree_levels + 1)]
+
+        # 重置树中每个AdvanceAddUnit的状态
+        for level in self.tree:
+            for adder in level:
+                adder.reset()
+
+    def get_pipeline_state(self):
+        """获取加法树的当前状态"""
+        # 收集树中每个加法单元的状态
+        tree_state = []
+        for level_idx, level in enumerate(self.tree):
+            level_state = []
+            for unit_idx, adder in enumerate(level):
+                level_state.append({
+                    "unit_idx": unit_idx,
+                    "state": adder.get_pipeline_state()
+                })
+            tree_state.append({
+                "level": level_idx,
+                "units": level_state
+            })
+
+        return {
+            "cycle_count": self.cycle_count,
+            "tree_levels": self.tree_levels,
+            "PE_num": self.PE_num,
+            "stage_valid": self.stage_valid_vec,
+            "stage_output_sizes": [len(outputs) for outputs in self.stage_output_vec],
+            "stage_evict_sizes": [len(evicts) for evicts in self.stage_evict_vec],
+            "tree_state": tree_state
+        }
+
+    def print_state(self):
+        """打印当前加法树的状态"""
+        state = self.get_pipeline_state()
+
+        print(f"\n==== AddTree 状态 (周期 {state['cycle_count']}) ====")
+        print(f"树级数: {state['tree_levels']}, PE数量: {state['PE_num']}")
+
+        # 打印各阶段状态
+        print("\n阶段有效状态:")
+        for i, valid in enumerate(state['stage_valid']):
+            print(f"  阶段 {i}: {'有效' if valid else '无效'}")
+
+        print("\n阶段输出大小:")
+        for i, size in enumerate(state['stage_output_sizes']):
+            print(f"  阶段 {i} 输出: {size} 项")
+
+        print("\n阶段驱逐索引大小:")
+        for i, size in enumerate(state['stage_evict_sizes']):
+            print(f"  阶段 {i} 驱逐索引: {size} 项")
+
+        # 打印树的简要状态
+        print("\n树结构状态摘要:")
+        for level in state['tree_state']:
+            level_idx = level['level']
+            units_count = len(level['units'])
+            active_units = sum(1 for unit in level['units'] if 
+                            unit['state']['stage1']['valid'] or 
+                            unit['state']['stage2']['valid'] or
+                            unit['state']['stage3']['valid'])
+
+            print(f"  级别 {level_idx}: {units_count} 个单元, {active_units} 个活跃")
+
+        print("=====================================")
+
+   
+
+    def run_pipeline_with_bf16(self, input_queues_batches, max_cycles=100, print_states=False):
+        """
+        运行加法树流水线，处理输入队列并将输入转换为BF16格式
         
+        Args:
+            input_queues_batches: 输入队列批次列表，每个元素是一个包含多个处理单元输入映射的列表
+            max_cycles: 最大运行周期数
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            results: 包含每个周期输出的列表
+        """
+        # 重置加法树状态
+        self.reset()
+
+        # 将输入值转换为BF16格式
+        bf16_input_queues_batches = []
+
+        for batch in input_queues_batches:
+            bf16_batch = []
+            
+            for queue in batch:
+                converted_queue = {}
+                for index, values in queue.items():
+                    # 将每个值转换为BF16格式
+                    converted_values = [convert_through_pipeline(float(val)) for val in values]
+                    converted_queue[index] = converted_values
+                bf16_batch.append(converted_queue)
+            
+            bf16_input_queues_batches.append(bf16_batch)
+
+        # 运行流水线
+        return self.run_pipeline(bf16_input_queues_batches, max_cycles, print_states)
+
+    def run_pipeline(self, input_queues, max_cycles=100, print_states=False):
+        """
+        运行加法树流水线，处理输入队列
+        
+        Args:
+            input_queues: 输入队列列表，每个元素对应一个处理单元的输入映射
+            max_cycles: 最大运行周期数
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            results: 包含每个周期输出的列表
+        """
+        # 重置加法树状态
+        self.reset()
+
+        # 初始化结果列表
+        results = []
+        input_idx = 0
+        cycle = 0        
+        # 运行流水线，直到完成处理或达到最大周期
+        while (input_idx < len(input_queues) or self.is_active()) and cycle < max_cycles:
+        #while cycle < 20:
+            if input_idx < len(input_queues):
+                input_queue = input_queues[input_idx]
+                valid = True
+                input_idx += 1
+            else:
+                input_queue = []
+                valid = False
+            
+            result = self.clock_cycle(valid, input_queue)
+
+            results.append(result)
+
+            # 如果需要，打印当前状态
+            #if print_states:
+            #    print(f"\n--- 周期 {cycle + 1} ---")
+            #    self.print_state()
+
+            # 检查流水线是否还在处理数据
+            #if not self.is_active() and cycle > self.tree_levels:
+            #    break
+            cycle += 1
+
+        # 如果达到最大周期数而流水线仍在处理，发出警告
+        if cycle >= max_cycles - 1 and self.is_active():
+            print(f"警告: 达到最大周期数 {max_cycles}，流水线可能未完全排空")
+            
+        print(cycle)
+
+        return results
+
+    def is_active(self):
+        """
+        检查加法树是否仍在处理数据
+        
+        Returns:
+            bool: 如果任何阶段有效或任何加法单元活跃则返回True
+        """
+        # 检查所有阶段的有效标志
+        if any(self.stage_valid_vec):
+            return True
+
+        # 检查树中的每个加法单元
+        for level in self.tree:
+            for adder in level:
+                if adder.is_active():
+                    return True
+
+        return False                    
+
 
 class TrapezoidPipeline:
     def __init__(self, M, K, N, PE_num=4):
@@ -1193,16 +1421,27 @@ class TrapezoidPipeline:
         self.width = M * N
         self.bit_width = K
         self.PE_num = PE_num
-        self.mfiu = MFIUPipeline()
+        self.M = M
+        self.N = N
+        self.K = K
 
+        self.c_values = [0] * self.M * self.N
+
+        self.mfiu = MFIUPipeline(self.width, self.bit_width)
+        self.mul_vec = [MACUnit() for _ in range(self.PE_num)]
+        self.add_tree = AddTree(self.PE_num, self.c_values, self.M, self.N)
+
+        self.values_A_queue = []
+        self.values_B_queue = []
+        
         # stage1: 预输入处理数据
         self.stage1_valid = False
-        self.stage1_values_A = np.array([])
-        self.stage1_values_B = np.array([])
         self.stage1_offset_A = np.array([])
         self.stage1_offset_B = np.array([])
         self.stage1_masks_A = []
         self.stage1_masks_B = []
+        self.stage1_values_A = np.array([])
+        self.stage1_values_B = np.array([])
 
         # stage2: mfiu模块
         self.stage2_valid = False
@@ -1216,7 +1455,20 @@ class TrapezoidPipeline:
         self.stage3_mul_queue_b = [[] for _ in range(self.PE_num)]
         self.stage3_sft_index_queue = [[] for _ in range(self.PE_num)]
 
+        # stage4: 乘法单元
+        self.stage4_valid = False
+        self.stage4_input_map_queue = []
+
+        # stage5: add tree
+        self.stage5_valid = False
+
         self.cycle_count = 0
+
+    def init_c_values(self):
+        c_values = [0] * self.M * self.N
+        for i in range(len(c_values)):
+            c_values[i] = FP32toBF16Pipeline(c_values[i])
+        self.c_values_bf16 = c_values
 
     def pad_queues(self):
         max_len_a = (
@@ -1248,8 +1500,42 @@ class TrapezoidPipeline:
 
         self.cycle_count += 1
 
+        # stage5 add tree
+        result = self.add_tree.clock_cycle(self.stage4_valid, self.stage4_input_map_queue)
+        self.stage5_valid = result["valid"]
+        if result["valid"]:
+            assert len(result["output"]) == 1
+            if result["output"][0]:
+                index = next(iter(result["output"][0]))
+                value = result["output"][0][index][0]
+                m = index % self.M
+                n = int(index / self.M)
+                if index != -1:
+                    self.c_values[m * self.N + n] += value
+
+        # stage4 乘法单元
+        for i, mul in enumerate(self.mul_vec):
+            assert len(self.stage3_mul_queue_a[i]) == len(self.stage3_mul_queue_b[i])
+            assert len(self.stage3_mul_queue_b[i]) == len(self.stage3_sft_index_queue[i])
+            
+            mul.get_input(
+                self.stage3_valid,
+                self.stage3_mul_queue_a[i].pop(0) if self.stage3_valid else 0,
+                self.stage3_mul_queue_b[i].pop(0) if self.stage3_valid else 0,
+                self.stage3_sft_index_queue[i].pop(0) if self.stage3_valid else 0
+            )
+            result = mul.clock_cycle()
+            self.stage4_valid = mul.valid
+            if mul.valid:
+                index = mul.index_queue.pop(0)
+                temp_map = {index: [result]}
+                self.stage4_input_map_queue.append(temp_map)
+            else:
+                self.stage4_input_map_queue = []
+
         # stage3 获得输入队列
-        self.stage3_valid = self.stage2_valid
+        # self.stage3_valid = self.stage2_valid
+        # 事实上stage3_valid通过self.mul_queue的长度判断
         if self.stage2_valid:
             sft_index_a = self.stage2_index[0]
             sft_index_b = self.stage2_index[1]
@@ -1271,9 +1557,10 @@ class TrapezoidPipeline:
                     if sft_row_b[i] != 0:
                         self.stage3_mul_queue_b[
                             (sft_row_b[i] - 1) % self.PE_num
-                        ].append(self.stage1_values_B[i])
+                        ].append(self.stage2_values_B[i])
             self.pad_queues()
-
+        for i, _ in enumerate(self.mul_vec):
+            self.stage3_valid = len(self.stage3_mul_queue_a[i]) > 0
         # stage2: mfiu模块
         results = self.mfiu.clock_cycle(
             self.stage1_valid,
@@ -1287,22 +1574,28 @@ class TrapezoidPipeline:
         self.stage2_valid = results["valid"]
         if self.stage2_valid:
             self.stage2_index = results["output"]
-            self.stage2_values_A = self.stage1_values_A.copy()
-            self.stage2_values_B = self.stage1_values_B.copy()
+            self.stage2_values_A = self.values_A_queue.pop(0)
+            self.stage2_values_B = self.values_B_queue.pop(0)
         else:
             self.stage2_index = ([], [])
+            self.stage2_values_A = np.array([])
+            self.stage2_values_B = np.array([])
 
         # stage1: 预输入处理数据
         self.stage1_valid = valid
         if valid:
             csr_A = csr_matrix(A)
             csr_B = csr_matrix(B.T)
-            self.stage1_values_A, self.stage1_offset_A, self.stage1_masks_A = (
+            values_A, self.stage1_offset_A, self.stage1_masks_A = (
                 get_values_offset_mask(csr_A)
             )
-            self.stage1_values_B, self.stage1_offset_B, self.stage1_masks_B = (
+            self.stage1_values_A = values_A
+            self.values_A_queue.append(values_A)
+            values_B, self.stage1_offset_B, self.stage1_masks_B = (
                 get_values_offset_mask(csr_B)
             )
+            self.values_B_queue.append(values_B)
+            self.stage1_values_B = values_B
         else:
             self.stage1_values_A = np.array([])
             self.stage1_values_B = np.array([])
@@ -1310,6 +1603,307 @@ class TrapezoidPipeline:
             self.stage1_offset_B = np.array([])
             self.stage1_masks_A = []
             self.stage1_masks_B = []
+            
+        return {
+            "cycle": self.cycle_count,
+            "valid": self.stage5_valid,
+            "output": self.c_values if self.stage5_valid else None
+        }
+        
+    def is_active(self):
+        """检查流水线是否仍在活跃处理数据"""
+        # 检查各阶段是否有效
+        if (self.stage1_valid or self.stage2_valid or self.stage3_valid or 
+            self.stage4_valid or self.stage5_valid):
+            return True    
+        if self.add_tree.is_active():
+            return True
+        if self.mfiu.is_active():
+            return True
+        for mul in self.mul_vec:
+            if mul.is_active():
+                return True
+        return False
+        
+    
+    def reset(self):
+        """重置TrapezoidPipeline的所有状态"""
+        # 重置周期计数
+        self.cycle_count = 0
+        
+        # 重置C矩阵值
+        self.c_values = [0] * self.M * self.N
+        
+        # 重置各子模块
+        self.mfiu.reset()
+        for mac in self.mul_vec:
+            mac.multiply_pipeline.reset()
+            mac.input1 = 0
+            mac.input2 = 0
+            mac.index_queue = []
+            mac.valid = False
+            mac.input_valid = False
+        
+        self.add_tree.reset()
+        
+        # 重置stage1状态
+        self.stage1_valid = False
+        self.stage1_values_A = np.array([])
+        self.stage1_values_B = np.array([])
+        self.stage1_offset_A = np.array([])
+        self.stage1_offset_B = np.array([])
+        self.stage1_masks_A = []
+        self.stage1_masks_B = []
+        
+        # 重置stage2状态
+        self.stage2_valid = False
+        self.stage2_index = ([], [])
+        self.stage2_values_A = np.array([])
+        self.stage2_values_B = np.array([])
+        
+        # 重置stage3状态
+        self.stage3_valid = False
+        self.stage3_mul_queue_a = [[] for _ in range(self.PE_num)]
+        self.stage3_mul_queue_b = [[] for _ in range(self.PE_num)]
+        self.stage3_sft_index_queue = [[] for _ in range(self.PE_num)]
+        
+        # 重置stage4状态
+        self.stage4_valid = False
+        self.stage4_input_map_queue = []
+        
+        # 重置stage5状态
+        self.stage5_valid = False
+
+    def get_pipeline_state(self):
+        """获取TrapezoidPipeline的当前状态"""
+        # 收集各个乘法单元的状态
+        mac_states = []
+        for i, mac in enumerate(self.mul_vec):
+            mac_states.append({
+                "index": i,
+                "valid": mac.valid,
+                "input_valid": mac.input_valid,
+                "index_queue_length": len(mac.index_queue),
+                "pipeline_active": mac.is_active()
+            })
+        
+        # 提取当前各阶段队列的大小和状态
+        stage3_queue_sizes = []
+        for i in range(self.PE_num):
+            stage3_queue_sizes.append({
+                "PE": i,
+                "mul_queue_a_size": len(self.stage3_mul_queue_a[i]),
+                "mul_queue_b_size": len(self.stage3_mul_queue_b[i]),
+                "sft_index_queue_size": len(self.stage3_sft_index_queue[i])
+            })
+        
+        # 汇总整个流水线的状态
+        return {
+            "cycle_count": self.cycle_count,
+            "configuration": {
+                "M": self.M,
+                "K": self.K,
+                "N": self.N,
+                "PE_num": self.PE_num,
+                "width": self.width,
+                "bit_width": self.bit_width
+            },
+            "stages": {
+                "stage1": {
+                    "valid": self.stage1_valid,
+                    "values_A_size": len(self.stage1_values_A),
+                    "values_B_size": len(self.stage1_values_B),
+                    "masks_A_size": len(self.stage1_masks_A),
+                    "masks_B_size": len(self.stage1_masks_B)
+                },
+                "stage2": {
+                    "valid": self.stage2_valid,
+                    "index_size": (len(self.stage2_index[0]), len(self.stage2_index[1])) if self.stage2_index else (0, 0),
+                    "values_A_size": len(self.stage2_values_A),
+                    "values_B_size": len(self.stage2_values_B)
+                },
+                "stage3": {
+                    "valid": self.stage3_valid,
+                    "queue_sizes": stage3_queue_sizes
+                },
+                "stage4": {
+                    "valid": self.stage4_valid,
+                    "input_map_queue_size": len(self.stage4_input_map_queue)
+                },
+                "stage5": {
+                    "valid": self.stage5_valid
+                }
+            },
+            "components": {
+                "mac_units": mac_states,
+                "mfiu_state": self.mfiu.get_pipeline_state(),
+                "add_tree_state": self.add_tree.get_pipeline_state()
+            },
+            "result": {
+                "c_values_non_zero": sum(1 for v in self.c_values if v != 0)
+            }
+        }
+
+    def print_state(self):
+        """打印TrapezoidPipeline的当前状态"""
+        state = self.get_pipeline_state()
+        
+        print(f"\n====== TrapezoidPipeline 状态 (周期 {state['cycle_count']}) ======")
+        print(f"配置: M={state['configuration']['M']}, K={state['configuration']['K']}, " 
+            f"N={state['configuration']['N']}, PE数量={state['configuration']['PE_num']}")
+        
+        # 打印各阶段状态
+        print("\n--- 流水线阶段状态 ---")
+        
+        print(f"Stage 1 (输入处理): {'有效' if state['stages']['stage1']['valid'] else '无效'}")
+        if state['stages']['stage1']['valid']:
+            print(f"  A矩阵值数量: {state['stages']['stage1']['values_A_size']}")
+            print(f"  B矩阵值数量: {state['stages']['stage1']['values_B_size']}")
+            print(f"  A矩阵掩码数量: {state['stages']['stage1']['masks_A_size']}")
+            print(f"  B矩阵掩码数量: {state['stages']['stage1']['masks_B_size']}")
+        
+        print(f"Stage 2 (MFIU): {'有效' if state['stages']['stage2']['valid'] else '无效'}")
+        if state['stages']['stage2']['valid']:
+            print(f"  索引大小: A={state['stages']['stage2']['index_size'][0]}, B={state['stages']['stage2']['index_size'][1]}")
+            print(f"  A矩阵值数量: {state['stages']['stage2']['values_A_size']}")
+            print(f"  B矩阵值数量: {state['stages']['stage2']['values_B_size']}")
+        
+        print(f"Stage 3 (输入队列): {'有效' if state['stages']['stage3']['valid'] else '无效'}")
+        if state['stages']['stage3']['valid']:
+            print("  PE输入队列大小:")
+            for pe in state['stages']['stage3']['queue_sizes']:
+                print(f"    PE{pe['PE']}: A队列={pe['mul_queue_a_size']}, B队列={pe['mul_queue_b_size']}, 索引队列={pe['sft_index_queue_size']}")
+        
+        print(f"Stage 4 (乘法单元): {'有效' if state['stages']['stage4']['valid'] else '无效'}")
+        if state['stages']['stage4']['valid']:
+            print(f"  输入映射队列大小: {state['stages']['stage4']['input_map_queue_size']}")
+        
+        print(f"Stage 5 (加法树): {'有效' if state['stages']['stage5']['valid'] else '无效'}")
+        
+        # 打印组件状态摘要
+        print("\n--- 组件状态摘要 ---")
+        
+        # MAC单元状态
+        active_macs = sum(1 for mac in state['components']['mac_units'] if mac['valid'] or mac['pipeline_active'])
+        print(f"乘法单元: {active_macs}/{len(state['components']['mac_units'])} 活跃")
+        
+        # MFIU状态
+        mfiu_active = any(state['components']['mfiu_state'][f'stage{i}']['valid'] for i in range(1, 6))
+        print(f"MFIU: {'活跃' if mfiu_active else '空闲'}")
+        
+        # 加法树状态
+        tree_active = any(state['components']['add_tree_state']['stage_valid'])
+        print(f"加法树: {'活跃' if tree_active else '空闲'}")
+        
+        # 结果矩阵状态
+        print(f"\n结果矩阵: {state['result']['c_values_non_zero']}/{self.M * self.N} 非零元素")
+        
+        # 如果需要查看C矩阵的非零元素，取决于大小是否合理显示
+        if self.M <= 8 and self.N <= 8:
+            c_matrix = np.array(self.c_values).reshape(self.M, self.N)
+            print("\nC矩阵值 (BF16格式):")
+            print(c_matrix)
+            
+            # 转换为浮点数显示
+            c_matrix_float = np.array([bf16_to_float(v) for v in self.c_values]).reshape(self.M, self.N)
+            print("\nC矩阵值 (浮点数):")
+            print(c_matrix_float)
+        
+        print("=====================================")
+    
+    def run_pipeline(self, input_matrices, max_cycles=100, print_states=False):
+        """
+        运行整个Trapezoid流水线处理一组输入矩阵
+        
+        Args:
+            input_matrices: 列表，每个元素是(A矩阵, B矩阵)元组，表示每个时钟周期的输入
+            max_cycles: 最大运行周期数，防止无限循环
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            results: 包含每个时钟周期输出的列表
+            final_c_values: 最终的C矩阵值
+        """
+        # 重置流水线状态
+        #self.reset()
+        
+        # 初始化结果列表
+        results = []
+        
+        # 创建输入队列
+        input_idx = 0
+        
+        # 运行流水线，直到处理完所有输入并且没有更多有效数据
+        cycle = 0
+        while (input_idx < len(input_matrices) or self.is_active()) and cycle < max_cycles:
+            # 获取当前周期的输入，如果有的话
+            if input_idx < len(input_matrices):
+                A, B = input_matrices[input_idx]
+                valid = True
+                input_idx += 1
+            else:
+                A, B = np.array([]), np.array([])
+                valid = False
+            
+            # 运行一个时钟周期
+            result = self.clock_cycle(valid, A, B)
+            results.append(result)
+            
+            # 如果需要，打印当前状态
+            if print_states and (cycle % 10 == 0 or cycle < 5 or cycle >= len(input_matrices) - 3):
+                print(f"\n--- 周期 {cycle + 1} ---")
+                self.print_state()
+            
+            cycle += 1
+        
+        # 检查是否因为达到最大周期数而退出
+        if cycle >= max_cycles and (input_idx < len(input_matrices) or self.is_active()):
+            print(f"警告: 达到最大周期数 {max_cycles}，流水线可能未完全排空")
+        
+        # 转换结果矩阵为浮点数
+        final_c_matrix = np.array([bf16_to_float(v) for v in self.c_values]).reshape(self.M, self.N)
+        
+        return {
+            "results": results,
+            "cycles": cycle,
+            "c_matrix": final_c_matrix,
+            "c_values_bf16": self.c_values.copy()
+        }
+
+    def run_pipeline_with_bf16(self, input_matrices, max_cycles=100, print_states=False):
+        """
+        运行Trapezoid流水线，将输入矩阵转换为BF16格式
+        
+        Args:
+            input_matrices: 列表，每个元素是(A矩阵, B矩阵)元组
+            max_cycles: 最大运行周期数
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            结果字典，包含运行结果和最终矩阵
+        """
+        # 将所有输入转换为BF16格式
+        bf16_input_matrices = []
+        
+        for A, B in input_matrices:
+            # 转换A矩阵
+            A_bf16 = np.zeros_like(A)
+            for i in range(A.shape[0]):
+                for j in range(A.shape[1]):
+                    if A[i, j] != 0:
+                        A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+            
+            # 转换B矩阵
+            B_bf16 = np.zeros_like(B)
+            for i in range(B.shape[0]):
+                for j in range(B.shape[1]):
+                    if B[i, j] != 0:
+                        B_bf16[i, j] = convert_through_pipeline(float(B[i, j]))
+            
+            bf16_input_matrices.append((A_bf16, B_bf16))
+        
+        # 运行流水线
+        return self.run_pipeline(bf16_input_matrices, max_cycles, print_states)
 
 
 # 测试代码
@@ -1363,15 +1957,20 @@ def test_AdvanceAdd():
 
     # 准备输入数据
     input_pairs = [
-        ({0: [5], -1: [5]}, {-1: [3]}),           # 周期1: 合并得到 {1: [5, 3]}
-        ({2: [4]}, {3: [7]}),           # 周期2: {2: [4]}, {3: [7]}
-        ({}, {})                        # 周期3: 空输入
+    #    ({0: [5]}, {0: [3]}),           # 周期1: 合并得到 {1: [5, 3]}
+    #    ({2: [1]}, {1: [1]}),           # 周期2: {2: [4]}, {3: [7]}
+        ({2: [2]}, {1: [3]}),
+        ({2: [1]}, {-1: [0]}),
+    #    ({}, {})                        # 周期3: 空输入
     ]
 
     evict_indices = [
-        [],                           # 周期1: 驱逐索引1
-        [3],                           # 周期2: 驱逐索引2
-        []                             # 周期3: 无驱逐
+    #   [],                           # 周期1: 驱逐索引1
+        [],                           # 周期2: 驱逐索引2
+        [],                             # 周期3: 无驱逐
+    #    [],
+    #    [],
+       
     ]
 
     # 运行流水线
@@ -1384,6 +1983,188 @@ def test_AdvanceAdd():
     c_values_float = [bf16_to_float(c) for c in adder.c_values]
     print(c_values_float)
 
+def test_AddTree():
+    print("\n===== 测试 AddTree =====")
+
+    c_values = [0] * 4
+    M = 1
+    N = 4
+
+    add_tree = AddTree(PE_num=4, c_values=c_values, M=M, N=N)
+
+    # input_maps_queue = [
+    #    [
+    #        {0: [1.0]},
+    #        {2: [1.0]},
+    #        {2: [1.0]},
+    #        {3: [1.0]},
+    #        {-1: [0.0]},
+    #        {-1: [0.0]},
+    #        {-1: [0.0]},
+    #        {-1: [0.0]},
+    #
+    #    ]
+    # ]
+
+    input_maps_queue = [
+        [
+            {0: [1.0]},
+            {1: [1.0]},
+            {1: [1.0]},
+            {2: [1.0]},
+        ],
+        [
+            {3: [1.0]},
+            {-1: [0.0]},
+            {-1: [0.0]},
+            {-1: [0.0]},
+        ],
+    ]
+
+    print("\n使用BF16模式运行加法树...")
+    results = add_tree.run_pipeline_with_bf16(
+        input_maps_queue, max_cycles=40, print_states=True
+    )
+
+    # 打印输出结果
+    print("\n加法树输出结果:")
+    for i, res in enumerate(results):
+        if res["valid"]:
+            # 将BF16输出转换为浮点数
+            float_outputs = {}
+            if res["output"]:
+                for out_map in res["output"]:
+                    for idx, vals in out_map.items():
+                        if idx not in float_outputs:
+                            float_outputs[idx] = []
+                        float_outputs[idx].extend([bf16_to_float(v) for v in vals])
+
+            print(f"周期 {i+1}: {float_outputs}")
+
+    # output加至C
+    for res in results:
+        if res["valid"]:
+            if res["output"][0]:
+                index = next(iter(res["output"][0]))
+                value = res["output"][0][index][0]
+                m = index % M
+                n = int(index / M)
+                if index != -1:
+                    c_values[m * N + n] += value
+
+    # 打印驱逐到C矩阵的值
+    print("\n结果矩阵C:")
+    float_c_values = [bf16_to_float(v) for v in c_values]
+    c_matrix = np.array(float_c_values).reshape(M, N)
+    print(c_matrix)
+
+
+def test_simple_case():
+    """测试简单的矩阵乘法案例"""
+    print("\n===== 测试简单矩阵乘法 =====")
+
+    # 定义简单的测试矩阵
+    A = np.array([[1, 0, 1, 0], [0, 1, 1, 0]])
+    B = np.array([[1, 1], [0, 0], [0, 1], [1, 0]])
+
+    M, K = A.shape
+    _, N = B.shape
+
+    # 计算正确结果作为参考
+    expected_C = naive_matmul(A, B)
+    print("预期结果矩阵：")
+    print(expected_C)
+
+    # 创建TrapezoidPipeline实例
+    pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=4)
+
+    # 运行流水线
+    print("\n运行流水线...")
+    start_time = time.time()
+    result = pipeline.run_pipeline_with_bf16([(A, B)], print_states=True)
+    end_time = time.time()
+
+    # 打印结果
+    print(f"\n流水线运行完成，耗时: {(end_time - start_time)*1000:.2f}ms")
+    print(f"总周期数: {result['cycles']}")
+    print("\n实际结果矩阵：")
+    print(result["c_matrix"])
+
+    # 验证结果
+    print("\n结果验证：")
+    if np.allclose(expected_C, result["c_matrix"], rtol=1e-2, atol=1e-2):
+        print("✓ 结果正确！")
+    else:
+        print("✗ 结果不匹配！")
+        print("差异矩阵：")
+        print(expected_C - result["c_matrix"])
+
+
+def test_sparse_matrices():
+    """测试稀疏矩阵乘法"""
+    print("\n===== 测试稀疏矩阵乘法 =====")
+
+    # 创建稀疏矩阵
+    np.random.seed(42)
+    M, K, N = 1, 2, 4
+    
+    # 随机生成稀疏矩阵
+    
+    A = np.random.choice([0, 1], size=(M, K), p=[0, 1])
+    B = np.random.choice([0, 1], size=(K, N), p=[0.5, 0.5])
+    print(A)
+    print(B)
+
+    # 计算参考结果
+    expected_C = naive_matmul(A, B)
+
+    # 创建TrapezoidPipeline实例
+    pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=4)
+
+    # 运行流水线
+    print("\n运行流水线...")
+    start_time = time.time()
+    result = pipeline.run_pipeline_with_bf16([(A, B)], print_states=False)
+    end_time = time.time()
+
+    # 打印结果摘要
+    print(f"\n流水线运行完成，耗时: {(end_time - start_time)*1000:.2f}ms")
+    print(f"总周期数: {result['cycles']}")
+    print(
+        f"A矩阵非零元素: {np.count_nonzero(A)} / {A.size} ({np.count_nonzero(A)/A.size*100:.1f}%)"
+    )
+    print(
+        f"B矩阵非零元素: {np.count_nonzero(B)} / {B.size} ({np.count_nonzero(B)/B.size*100:.1f}%)"
+    )
+    print(
+        f"C矩阵非零元素: {np.count_nonzero(result['c_matrix'])} / {M*N} ({np.count_nonzero(result['c_matrix'])/(M*N)*100:.1f}%)"
+    )
+
+    # 验证结果
+    print("\n结果验证：")
+    if np.allclose(expected_C, result["c_matrix"], rtol=1e-2, atol=1e-2):
+        print("✓ 结果正确！")
+
+        # 显示一些结果样本
+        print("\n结果矩阵样本（前5x5）：")
+        sample_size = min(5, M, N)
+        print("期望值:")
+        print(expected_C[:sample_size, :sample_size])
+        print("实际值:")
+        print(result["c_matrix"][:sample_size, :sample_size])
+    else:
+        print("✗ 结果不匹配！")
+        print("差异矩阵样本（前5x5）：")
+        sample_size = min(5, M, N)
+        diff = expected_C - result["c_matrix"]
+        print(diff[:sample_size, :sample_size])
+        max_diff = np.max(np.abs(diff))
+        print(f"最大差异: {max_diff}")
+
+
 if __name__ == "__main__":
     #test_MFIU()
-    test_AdvanceAdd()
+    #test_AdvanceAdd()
+    test_AddTree()
+    #test_simple_case()
+    #test_sparse_matrices()
