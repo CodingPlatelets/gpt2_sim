@@ -1,4 +1,3 @@
-import numpy as np
 from typing import Tuple, Dict, Optional, Union, List, Any, Callable
 from collections import deque
 

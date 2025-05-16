@@ -171,9 +171,19 @@ class ReactiveHBMOperation(Observable[bytes]):
                     self.notify(result_data or self.data)
                 else:
                     self.notify(bytes(f"{self.address}".encode()))
-                self.notify_completed()
+                
+                # 确保在独立的try块中调用notify_completed，以便数据通知后一定会触发完成事件
+                try:
+                    self.notify_completed()
+                except Exception as e:
+                    print(f"操作完成事件通知出错: {e}")
             except Exception as e:
-                print(f"操作完成通知出错: {e}")
+                print(f"操作数据通知出错: {e}")
+                # 即使数据通知失败，也尝试发送完成事件
+                try:
+                    self.notify_completed()
+                except Exception as e2:
+                    print(f"操作完成事件通知出错: {e2}")
 
 
 class ReactiveHBMBuffer:
@@ -369,12 +379,13 @@ class ReactiveHBMBuffer:
         """模拟时钟滴答，处理已完成的操作"""
         while self._clock_running:
             try:
+                completed_ops = []
+                
                 with self._lock:
                     # 增加周期
                     self.current_cycle += 1
                     
                     # 检查是否有完成的操作
-                    completed_ops = []
                     for op in list(self.pending_operations):
                         if op.completion_cycle <= self.current_cycle:
                             self.pending_operations.remove(op)
@@ -387,11 +398,17 @@ class ReactiveHBMBuffer:
                     except Exception as e:
                         print(f"操作完成处理错误: {e}")
                 
+                # 确保操作完成通知后再检查是否需要停止时钟
                 with self._lock:
                     # 如果没有待处理的操作，停止时钟
                     if not self.pending_operations:
-                        self._clock_running = False
-                        break
+                        # 给所有完成的操作一点时间来发送它们的通知
+                        if completed_ops:
+                            # 如果刚处理过操作，再等待一个周期
+                            continue
+                        else:
+                            self._clock_running = False
+                            break
             except Exception as e:
                 print(f"时钟周期处理错误: {e}")
             
@@ -425,12 +442,26 @@ class ReactiveHBMBuffer:
     def wait_until_idle(self, timeout_ms: int = 5000) -> bool:
         """等待直到所有操作完成"""
         start_time = time.time()
+        last_pending_count = -1
+        
         while True:
             with self._lock:
-                if not self.pending_operations:
-                    return True
+                pending_count = len(self.pending_operations)
+                
+                # 如果没有待处理操作，且上一次检查时也没有，则认为已完全空闲
+                if pending_count == 0:
+                    if last_pending_count == 0:
+                        # 再等待一小段时间确保所有操作都完成了它们的通知
+                        time.sleep(0.01)
+                        return True
+                    last_pending_count = 0
+                else:
+                    last_pending_count = pending_count
             
+            # 短暂睡眠，避免过度占用CPU
             time.sleep(0.01)
+            
+            # 检查超时
             if time.time() - start_time > timeout_ms / 1000:
                 return False
 
