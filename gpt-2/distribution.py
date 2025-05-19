@@ -625,13 +625,12 @@ def get_values_offset_mask(matrix:csr_matrix):
 
 if __name__ == "__main__":
 
-    """
     # 测试用例1：简单的2x4和4x2矩阵
     print("\n===== 测试用例1：简单矩阵 =====")
-    A1 = np.array([[1, 0, 1, 0],
+    A1 = np.array([[2, 0, 1, 0],
                    [0, 1, 1, 0]])
 
-    B1 = np.array([[1, 1],
+    B1 = np.array([[2, 3],
                    [0, 0],
                    [0, 1],
                    [1, 0]])
@@ -643,7 +642,7 @@ if __name__ == "__main__":
     trapezoid1.run(A1, B1)
     print(f"Trapezoid结果:\n{trapezoid1.C_matrix}")
     print(f"结果正确: {np.array_equal(expected1, trapezoid1.C_matrix)}")
-
+    """
     # 测试用例2：零矩阵
     print("\n===== 测试用例2：零矩阵 =====")
     A2 = np.zeros((3, 4), dtype=int)
@@ -656,7 +655,7 @@ if __name__ == "__main__":
     trapezoid2.run(A2, B2)
     print(f"Trapezoid结果:\n{trapezoid2.C_matrix}")
     print(f"结果正确: {np.array_equal(expected2, trapezoid2.C_matrix)}")
-    """
+    
     # 测试用例3：随机稀疏矩阵
     print("\n===== 测试用例3：随机稀疏矩阵 =====")
     # 创建稀疏矩阵，只有20%的元素为1
@@ -729,3 +728,4 @@ if __name__ == "__main__":
 #
 # expected5 = np.matmul(A5, B5)
 # print(f"预期结果:\n{expected5}")
+    """
