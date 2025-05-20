@@ -64,7 +64,7 @@ def store_csr_in_simple_blocks(csr_matrix, elements_per_block=2):
                 row_elements = 0
 
             current_pos += row_elements
-            block_row_ptr.append(current_pos)
+            block_row_ptr.append(int(current_pos))
 
         # 创建块
         block = {
@@ -268,52 +268,57 @@ def run_simple_blocks_tests():
 
     # 测试1: 简单示例 - 与原始例子相同
     print("\n测试1: 简单示例矩阵")
-    simple_matrix = np.array([[1, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
-    test_csr_simple_blocks(
-        simple_matrix,
-        elements_per_block=2,
-        print_blocks=5,
-        print_elements=5,
-        debug=True,
-    )
+    simple_matrix = np.array([[1, 1, 1, 0], [0, 0, 0, 0], [0, 1, 1, 0]])
+
+    blocks = store_csr_in_simple_blocks(csr_matrix(simple_matrix))
+    
+    print(blocks)
+
+    # blocks = test_csr_simple_blocks(
+    #    simple_matrix,
+    #    elements_per_block=2,
+    #    print_blocks=5,
+    #    print_elements=5,
+    #    debug=True,
+    # )
 
     ## 测试2: 无空行矩阵
-    #print("\n测试2: 无空行矩阵")
-    #no_empty_rows = np.array([[1, 0, 2, 0], [0, 3, 0, 4], [5, 0, 6, 0]])
-    #test_csr_simple_blocks(no_empty_rows, elements_per_block=3, debug=True)
+    # print("\n测试2: 无空行矩阵")
+    # no_empty_rows = np.array([[1, 0, 2, 0], [0, 3, 0, 4], [5, 0, 6, 0]])
+    # test_csr_simple_blocks(no_empty_rows, elements_per_block=3, debug=True)
 
     # 测试3: 中等大小矩阵
-    print("\n测试3: 中等大小矩阵 (5% 非零元素)")
-    np.random.seed(42)  # 设置随机种子以便结果可复现
-    medium_matrix = np.random.choice([0, 1], size=(4096, 4096), p=[0.9, 0.1])
-    test_csr_simple_blocks(medium_matrix, elements_per_block=256)
+    # print("\n测试3: 中等大小矩阵 (5% 非零元素)")
+    # np.random.seed(42)  # 设置随机种子以便结果可复现
+    # medium_matrix = np.random.choice([0, 1], size=(4096, 4096), p=[0.9, 0.1])
+    # test_csr_simple_blocks(medium_matrix, elements_per_block=256)
 
     ## 测试4: 不同分块大小对比
-    #print("\n测试4: 不同分块大小对比")
-    #matrix_for_sizes = np.random.choice([0, 1], size=(30, 30), p=[0.9, 0.1])
+    # print("\n测试4: 不同分块大小对比")
+    # matrix_for_sizes = np.random.choice([0, 1], size=(30, 30), p=[0.9, 0.1])
 #
-    #print("\n分块大小: 5 元素/块")
-    #test_csr_simple_blocks(matrix_for_sizes, elements_per_block=5, print_blocks=2)
+# print("\n分块大小: 5 元素/块")
+# test_csr_simple_blocks(matrix_for_sizes, elements_per_block=5, print_blocks=2)
 #
-    #print("\n分块大小: 10 元素/块")
-    #test_csr_simple_blocks(matrix_for_sizes, elements_per_block=10, print_blocks=2)
+# print("\n分块大小: 10 元素/块")
+# test_csr_simple_blocks(matrix_for_sizes, elements_per_block=10, print_blocks=2)
 #
-    #print("\n分块大小: 20 元素/块")
-    #test_csr_simple_blocks(matrix_for_sizes, elements_per_block=20, print_blocks=2)
+# print("\n分块大小: 20 元素/块")
+# test_csr_simple_blocks(matrix_for_sizes, elements_per_block=20, print_blocks=2)
 #
-    ## 测试5: 一行密集，其余稀疏
-    #print("\n测试5: 行密度差异大的矩阵")
-    #uneven_matrix = np.zeros((10, 20))
-    ## 一行非常密集
-    #uneven_matrix[5, :] = np.random.choice([0, 1, 2], size=20, p=[0.2, 0.4, 0.4])
-    ## 其余行稀疏
-    #for i in range(10):
-    #    if i != 5:
-    #        uneven_matrix[i, :] = np.random.choice([0, 1], size=20, p=[0.9, 0.1])
+## 测试5: 一行密集，其余稀疏
+# print("\n测试5: 行密度差异大的矩阵")
+# uneven_matrix = np.zeros((10, 20))
+## 一行非常密集
+# uneven_matrix[5, :] = np.random.choice([0, 1, 2], size=20, p=[0.2, 0.4, 0.4])
+## 其余行稀疏
+# for i in range(10):
+#    if i != 5:
+#        uneven_matrix[i, :] = np.random.choice([0, 1], size=20, p=[0.9, 0.1])
 #
-    #test_csr_simple_blocks(
-    #    uneven_matrix, elements_per_block=8, print_blocks=4, debug=True
-    #)
+# test_csr_simple_blocks(
+#    uneven_matrix, elements_per_block=8, print_blocks=4, debug=True
+# )
 
 
 if __name__ == "__main__":
