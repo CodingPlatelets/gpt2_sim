@@ -26,6 +26,7 @@ class TrapezoidPipeline:
         self.values_B_queue = []
 
         self.start_index_queue = []
+        self.nums_rows_queue = []
 
         # stage1: 预输入处理数据
         self.stage1_valid = False
@@ -148,10 +149,15 @@ class TrapezoidPipeline:
                 start_index_val = self.start_index_queue.pop(0)
             else:
                 start_index_val = 0
+                
+            if len(self.nums_rows_queue):
+                index_len = self.nums_rows_queue.pop(0)
+            else:
+                index_len = len(sft_index_b)
             
             sft_index_a = self.stage2_index[0]
             sft_index_b = self.stage2_index[1]
-            for sft_index in range(len(sft_index_b)):
+            for sft_index in range(index_len):
                 sft_row_a = sft_index_a[sft_index]
                 sft_row_b = sft_index_b[sft_index]
                 for i in range(len(sft_row_a)):
@@ -217,11 +223,12 @@ class TrapezoidPipeline:
             self.stage1_values_A = values_A
             self.values_A_queue.append(values_A)
 
-            values_B, self.stage1_offset_B, self.stage1_masks_B = (
+            values_B, self.stage1_offset_B, self.stage1_masks_B, nums_rows = (
                 get_values_offset_mask_direct(values_B_input, col_indices_input, row_ptr_input, self.K)
             )
             self.start_index_queue.append(start_index)
             self.values_B_queue.append(values_B)
+            self.nums_rows_queue.append(nums_rows)
             self.stage1_values_B = values_B
 
         else:

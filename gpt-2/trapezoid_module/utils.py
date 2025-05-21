@@ -92,4 +92,4 @@ def get_values_offset_mask_direct(values_input, col_indices_input, row_ptr_input
             row_mask |= 1 << (num_cols - 1 - col)
         masks.append(row_mask)
 
-    return values_input, row_ptr_input, masks
+    return values_input, row_ptr_input, masks, num_rows
