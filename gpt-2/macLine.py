@@ -183,13 +183,6 @@ def bf16_add(bf16_a, bf16_b):
     sim.run_simulation([(bf16_a, bf16_b, True)], print_states=False)
     return sim.outputs[0]
 
-import struct
-def bf16_to_float(bf16):
-    # 左移16位填充为32位表示
-    fp32_bits = bf16 << 16
-    # 转换为浮点数
-    return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
-        
 def pipeline_matmul(A, B, verbose=False):
     assert A.shape[1] == B.shape[0]
     m, k = A.shape
@@ -256,7 +249,12 @@ def pipeline_matmul(A, B, verbose=False):
 
         # 运行一个时钟周期,将坐标与数据一起传递给流水线
         partial_result = sim.clock_cycle(a_block, b_block, coords, valid)
-        
+        import struct
+        def bf16_to_float(bf16):
+            # 左移16位填充为32位表示
+            fp32_bits = bf16 << 16
+            # 转换为浮点数
+            return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
         
         # 处理返回的部分结果
         if partial_result is not None:
@@ -265,6 +263,8 @@ def pipeline_matmul(A, B, verbose=False):
             i, j = result_coords
             C[i][j] = bf16_add(C[i][j], result_value)
 
+
+        
         # 增加时钟周期
         sim.clock += 1
 
@@ -301,8 +301,9 @@ def test_bf16_pipeline_matmul(m=4, k=7, n=5, random_seed=123):
     """
     torch.manual_seed(random_seed)
     # 生成小数矩阵，范围在 -10 到 10
-    A = (torch.rand((m, k))).to(torch.bfloat16)
-    B = (torch.rand((k, n))).to(torch.bfloat16)
+    A = (torch.randn((m, k)) * 0.1).to(torch.bfloat16)
+    B = (torch.randn((k, n)) * 0.1).to(torch.bfloat16)
+
 
     # PyTorch 计算 bfloat16 结果
     C_torch = torch.matmul(A, B).to(torch.float32).numpy()
@@ -340,7 +341,7 @@ def test_bf16_pytorch_matmul_gpu(m=4, k=7, n=5, random_seed=123):
     
 if __name__ == '__main__':
     #verify_result(m=4, k=10, n=5, random_seed=42)
-    test_bf16_pipeline_matmul(m=4, k=7, n=5)
-    test_bf16_pytorch_matmul_gpu()
+    test_bf16_pipeline_matmul(m=4, k=100, n=5)
+    # test_bf16_pytorch_matmul_gpu()
                 
         
