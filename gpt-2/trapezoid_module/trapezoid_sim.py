@@ -4,7 +4,7 @@ from scipy.sparse import csr_matrix
 from .utils import FP32toBF16Pipeline, convert_through_pipeline, bf16_add, get_values_offset_mask, bf16_to_float, get_values_offset_mask_direct
 from .module.mfiu_sim import MFIUPipeline 
 from .module.add_tree_sim import AddTree
-from .module.compute_sim import MACUnit
+from .module.compute_sim import MultiplyUnit
 
 class TrapezoidPipeline:
     def __init__(self, M, K, N, PE_num=4):
@@ -19,7 +19,7 @@ class TrapezoidPipeline:
         self.c_values = [0] * self.M * self.N
 
         self.mfiu = MFIUPipeline(self.width, self.bit_width)
-        self.mul_vec = [MACUnit() for _ in range(self.PE_num)]
+        self.mul_vec = [MultiplyUnit() for _ in range(self.PE_num)]
         self.add_tree = AddTree(self.PE_num, self.c_values, self.M, self.N)
 
         self.values_A_queue = []
