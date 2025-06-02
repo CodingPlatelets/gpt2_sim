@@ -1,5 +1,7 @@
 import numpy as np
 from scipy.sparse import csr_matrix
+from tqdm import tqdm
+from collections import deque
 
 from .utils import FP32toBF16Pipeline, convert_through_pipeline, bf16_add, get_values_offset_mask, bf16_to_float, get_values_offset_mask_direct
 from .module.mfiu_sim import MFIUPipeline 
@@ -22,11 +24,11 @@ class TrapezoidPipeline:
         self.mul_vec = [MultiplyUnit() for _ in range(self.PE_num)]
         self.add_tree = AddTree(self.PE_num, self.c_values, self.M, self.N)
 
-        self.values_A_queue = []
-        self.values_B_queue = []
+        self.values_A_queue = deque()
+        self.values_B_queue = deque()
 
-        self.start_index_queue = []
-        self.nums_rows_queue = []
+        self.start_index_queue = deque()
+        self.nums_rows_queue = deque()
 
         # stage1: 预输入处理数据
         self.stage1_valid = False
@@ -45,9 +47,9 @@ class TrapezoidPipeline:
 
         # stage3: 获得输入队列
         self.stage3_valid = False
-        self.stage3_mul_queue_a = [[] for _ in range(self.PE_num)]
-        self.stage3_mul_queue_b = [[] for _ in range(self.PE_num)]
-        self.stage3_sft_index_queue = [[] for _ in range(self.PE_num)]
+        self.stage3_mul_queue_a = [deque() for _ in range(self.PE_num)]
+        self.stage3_mul_queue_b = [deque() for _ in range(self.PE_num)]
+        self.stage3_sft_index_queue = [deque() for _ in range(self.PE_num)]
 
         # stage4: 乘法单元
         self.stage4_valid = False
@@ -128,9 +130,9 @@ class TrapezoidPipeline:
 
             mul.get_input(
                 self.stage3_valid,
-                self.stage3_mul_queue_a[i].pop(0) if self.stage3_valid else 0,
-                self.stage3_mul_queue_b[i].pop(0) if self.stage3_valid else 0,
-                self.stage3_sft_index_queue[i].pop(0) if self.stage3_valid else 0,
+                self.stage3_mul_queue_a[i].popleft() if self.stage3_valid else 0,
+                self.stage3_mul_queue_b[i].popleft() if self.stage3_valid else 0,
+                self.stage3_sft_index_queue[i].popleft() if self.stage3_valid else 0,
             )
             result = mul.clock_cycle()
             self.stage4_valid = mul.valid
@@ -146,12 +148,12 @@ class TrapezoidPipeline:
         # 事实上stage3_valid通过self.mul_queue的长度判断
         if self.stage2_valid:
             if len(self.start_index_queue):
-                start_index_val = self.start_index_queue.pop(0)
+                start_index_val = self.start_index_queue.popleft()
             else:
                 start_index_val = 0
                 
             if len(self.nums_rows_queue):
-                index_len = self.nums_rows_queue.pop(0)
+                index_len = self.nums_rows_queue.popleft()
             else:
                 index_len = len(sft_index_b)
             
@@ -193,8 +195,8 @@ class TrapezoidPipeline:
         self.stage2_valid = results["valid"]
         if self.stage2_valid:
             self.stage2_index = results["output"]
-            self.stage2_values_A = self.values_A_queue.pop(0)
-            self.stage2_values_B = self.values_B_queue.pop(0)
+            self.stage2_values_A = self.values_A_queue.popleft()
+            self.stage2_values_B = self.values_B_queue.popleft()
         else:
             self.stage2_index = ([], [])
             self.stage2_values_A = np.array([])
@@ -285,9 +287,11 @@ class TrapezoidPipeline:
 
         self.add_tree.reset()
 
-        self.values_A_queue = []
-        self.values_B_queue = []
-        self.start_index_queue = []
+        # 重置为deque
+        self.values_A_queue = deque()
+        self.values_B_queue = deque()
+        self.start_index_queue = deque()
+        self.nums_rows_queue = deque()
 
         # 重置stage1状态
         self.stage1_valid = False
@@ -306,9 +310,9 @@ class TrapezoidPipeline:
 
         # 重置stage3状态
         self.stage3_valid = False
-        self.stage3_mul_queue_a = [[] for _ in range(self.PE_num)]
-        self.stage3_mul_queue_b = [[] for _ in range(self.PE_num)]
-        self.stage3_sft_index_queue = [[] for _ in range(self.PE_num)]
+        self.stage3_mul_queue_a = [deque() for _ in range(self.PE_num)]
+        self.stage3_mul_queue_b = [deque() for _ in range(self.PE_num)]
+        self.stage3_sft_index_queue = [deque() for _ in range(self.PE_num)]
 
         # 重置stage4状态
         self.stage4_valid = False
@@ -622,51 +626,73 @@ class TrapezoidPipeline:
         # 创建输入队列
         input_idx = 0
 
-        # 运行流水线，直到处理完所有输入并且没有更多有效数据
-        cycle = 0
-        while (input_idx < len(B_data_list) or self.is_active()) and cycle < max_cycles:
-            # 获取当前周期的输入，如果有的话
-            if input_idx < len(B_data_list):
-                # 总是获取A矩阵
-                A = A_matrices[0] 
+        # 估算总周期数：输入数据 + 流水线深度的缓冲
+        estimated_cycles = len(B_data_list) + 20  # 20是估算的流水线深度
+        
+        # 创建进度条
+        with tqdm(total=estimated_cycles, desc="HBM流水线处理", unit="cycle") as pbar:
+            # 运行流水线，直到处理完所有输入并且没有更多有效数据
+            cycle = 0
+            while (input_idx < len(B_data_list) or self.is_active()) and cycle < max_cycles:
+                # 获取当前周期的输入，如果有的话
+                if input_idx < len(B_data_list):
+                    # 总是获取A矩阵
+                    A = A_matrices[0] 
 
-                # 从B数据列表获取当前B的CSR格式数据
-                B_data = B_data_list[input_idx]
-                values_B = B_data.get("values", [])
-                col_indices = B_data.get("col_indices", [])
-                row_ptr = B_data.get("row_ptr", [])
-                start_index = B_data.get("row_start_index", 0)
+                    # 从B数据列表获取当前B的CSR格式数据
+                    B_data = B_data_list[input_idx]
+                    values_B = B_data.get("values", [])
+                    col_indices = B_data.get("col_indices", [])
+                    row_ptr = B_data.get("row_ptr", [])
+                    start_index = B_data.get("row_start_index", 0)
 
-                valid = True
-                input_idx += 1
-            else:
-                # 没有更多输入
-                A = np.array([[]])
-                values_B = []
-                col_indices = []
-                row_ptr = []
-                start_index = 0
-                valid = False
+                    valid = True
+                    input_idx += 1
+                else:
+                    # 没有更多输入
+                    A = np.array([[]])
+                    values_B = []
+                    col_indices = []
+                    row_ptr = []
+                    start_index = 0
+                    valid = False
 
-            # 运行一个时钟周期，使用HBM模式
-            result = self.clock_cycle(
-                valid=valid, 
-                A=A, 
-                B=np.array([]),  # 在HBM模式下B矩阵为空
-                is_hbm=True, 
-                start_index=start_index,
-                values_B_input=values_B, 
-                col_indices_input=col_indices, 
-                row_ptr_input=row_ptr
-            )
-            results.append(result)
+                # 运行一个时钟周期，使用HBM模式
+                result = self.clock_cycle(
+                    valid=valid, 
+                    A=A, 
+                    B=np.array([]),  # 在HBM模式下B矩阵为空
+                    is_hbm=True, 
+                    start_index=start_index,
+                    values_B_input=values_B, 
+                    col_indices_input=col_indices, 
+                    row_ptr_input=row_ptr
+                )
+                results.append(result)
 
-            # 如果需要，打印当前状态
-            if print_states and (cycle % 10 == 0 or cycle < 5 or cycle >= len(A_matrices) - 3):
-                print(f"\n--- 周期 {cycle + 1} (HBM模式) ---")
-                self.print_state()
+                # 更新进度条
+                cycle += 1
+                
+                # 动态更新进度条描述
+                if input_idx < len(B_data_list):
+                    pbar.set_description(f"HBM流水线处理 (输入 {input_idx}/{len(B_data_list)})")
+                else:
+                    pbar.set_description(f"HBM流水线处理 (排空中)")
+                
+                # 如果超出估算周期数，扩展进度条
+                if cycle >= pbar.total:
+                    pbar.total = cycle + 10
+                    pbar.refresh()
+                
+                pbar.update(1)
 
-            cycle += 1
+                # 如果需要，打印当前状态
+                if print_states and (cycle % 10 == 0 or cycle < 5 or cycle >= len(A_matrices) - 3):
+                    # 暂时禁用进度条输出，打印状态，然后重新启用
+                    pbar.write(f"\n--- 周期 {cycle} (HBM模式) ---")
+                    # 将状态信息写入到tqdm的输出中
+                    state_info = self.get_pipeline_state()
+                    pbar.write(f"流水线状态: {state_info}")
 
         # 检查是否因为达到最大周期数而退出
         if cycle >= max_cycles and (input_idx < len(A_matrices) or self.is_active()):
@@ -676,6 +702,8 @@ class TrapezoidPipeline:
         final_c_matrix = np.array([bf16_to_float(v) for v in self.c_values]).reshape(
             self.M, self.N
         )
+
+        print(f"✅ HBM流水线处理完成，总共 {cycle} 个周期")
 
         return {
             "results": results,
@@ -733,3 +761,209 @@ class TrapezoidPipeline:
 
         # 运行流水线
         return self.run_pipeline_hbm(bf16_A_matrices, bf16_B_data_list, max_cycles, print_states)
+
+    def run_pipeline_hbm_multi(
+        self, A_matrices, B_data_list, trapezoid_list, max_cycles=100, print_states=False
+    ):
+        """
+        运行多个Trapezoid流水线处理HBM格式的输入矩阵
+        
+        Args:
+            A_matrices: 稠密向量A的列表，每个元素是一个形状为(1, K)的numpy数组
+            B_data_list: 列表，每个元素是包含B矩阵CSR格式的字典，格式为
+                        {"values": [...], "col_indices": [...], "row_ptr": [...], "row_start_index": int}
+            trapezoid_list: TrapezoidPipeline实例的列表
+            max_cycles: 最大运行周期数，防止无限循环
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            结果字典，包含每个时钟周期输出和最终矩阵
+        """
+        # 初始化结果列表
+        all_results = []
+        num_trapezoids = len(trapezoid_list)
+        
+        # 验证输入
+        if not all(A.shape[0] == 1 for A in A_matrices):
+            raise ValueError("使用HBM模式时，所有A矩阵必须是稠密向量(形状为(1, K))")
+
+        # 创建输入队列
+        input_idx = 0
+
+        # 估算总周期数：输入数据 + 流水线深度的缓冲
+        estimated_cycles = len(B_data_list) + 20  # 20是估算的流水线深度
+        
+        print(f"🚀 开始多Trapezoid HBM处理: {num_trapezoids}个流水线")
+        
+        # 创建进度条
+        with tqdm(total=estimated_cycles, desc="多Trapezoid HBM处理", unit="cycle") as pbar:
+            # 运行流水线，直到处理完所有输入并且没有更多有效数据
+            cycle = 0
+            while (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)) and cycle < max_cycles:
+                
+                # 为每个trapezoid准备当前周期的输入
+                cycle_results = []
+                
+                for trap_idx, trapezoid in enumerate(trapezoid_list):
+                    # 计算当前trapezoid应该处理的B_data索引
+                    # 采用轮询分配策略
+                    current_b_data_idx = input_idx + trap_idx
+                    
+                    if current_b_data_idx < len(B_data_list):
+                        # 总是获取A矩阵（所有trapezoid共享同一个A）
+                        A = A_matrices[0] 
+
+                        # 从B数据列表获取当前B的CSR格式数据
+                        B_data = B_data_list[current_b_data_idx]
+                        values_B = B_data.get("values", [])
+                        col_indices = B_data.get("col_indices", [])
+                        row_ptr = B_data.get("row_ptr", [])
+                        start_index = B_data.get("row_start_index", 0)
+
+                        valid = True
+                    else:
+                        # 没有更多输入给这个trapezoid
+                        A = np.array([[]])
+                        values_B = []
+                        col_indices = []
+                        row_ptr = []
+                        start_index = 0
+                        valid = False
+
+                    # 运行当前trapezoid的一个时钟周期
+                    result = trapezoid.clock_cycle(
+                        valid=valid, 
+                        A=A, 
+                        B=np.array([]),  # 在HBM模式下B矩阵为空
+                        is_hbm=True, 
+                        start_index=start_index,
+                        values_B_input=values_B, 
+                        col_indices_input=col_indices, 
+                        row_ptr_input=row_ptr
+                    )
+                    
+                    # 添加trapezoid标识
+                    result["trapezoid_id"] = trap_idx
+                    cycle_results.append(result)
+                
+                # 更新输入索引（每个周期前进trapezoid数量个步长）
+                if input_idx < len(B_data_list):
+                    input_idx += num_trapezoids
+                
+                all_results.append(cycle_results)
+
+                # 更新进度条
+                cycle += 1
+                
+                # 动态更新进度条描述
+                active_traps = sum(1 for trap in trapezoid_list if trap.is_active())
+                if input_idx < len(B_data_list):
+                    pbar.set_description(f"多Trapezoid处理 (批次 {input_idx//num_trapezoids}/{len(B_data_list)//num_trapezoids}, 活跃:{active_traps})")
+                else:
+                    pbar.set_description(f"多Trapezoid处理 (排空中, 活跃:{active_traps})")
+                
+                # 如果超出估算周期数，扩展进度条
+                if cycle >= pbar.total:
+                    pbar.total = cycle + 10
+                    pbar.refresh()
+                
+                pbar.update(1)
+
+                # 如果需要，打印当前状态
+                if print_states and (cycle % 10 == 0 or cycle < 5):
+                    pbar.write(f"\n--- 周期 {cycle} (多Trapezoid HBM模式) ---")
+                    for i, trap in enumerate(trapezoid_list):
+                        state = trap.get_pipeline_state()
+                        pbar.write(f"  Trapezoid {i}: 周期{state['cycle_count']}, "
+                                f"活跃{'是' if trap.is_active() else '否'}, "
+                                f"非零结果{state['result']['c_values_non_zero']}")
+
+        # 检查是否因为达到最大周期数而退出
+        if cycle >= max_cycles and (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)):
+            print(f"警告: 达到最大周期数 {max_cycles}，流水线可能未完全排空")
+
+        # 收集所有trapezoid的最终结果
+        final_results = {}
+        combined_c_matrix = None
+        
+        for i, trapezoid in enumerate(trapezoid_list):
+            # 转换结果矩阵为浮点数
+            c_matrix = np.array([bf16_to_float(v) for v in trapezoid.c_values]).reshape(
+                trapezoid.M, trapezoid.N
+            )
+            final_results[f"trapezoid_{i}"] = {
+                "c_matrix": c_matrix,
+                "c_values_bf16": trapezoid.c_values.copy(),
+                "cycles": trapezoid.cycle_count
+            }
+            
+            # 如果所有trapezoid的矩阵大小相同，可以合并结果
+            if combined_c_matrix is None:
+                combined_c_matrix = c_matrix.copy()
+            else:
+                combined_c_matrix += c_matrix
+
+        print(f"✅ 多Trapezoid HBM处理完成，总共 {cycle} 个周期")
+
+        return {
+            "all_cycle_results": all_results,
+            "cycles": cycle,
+            "individual_results": final_results,
+            "combined_c_matrix": combined_c_matrix,
+            "num_trapezoids": num_trapezoids
+        }
+
+    def run_pipeline_hbm_multi_with_bf16(
+        self, A_matrices, B_data_list, trapezoid_list, max_cycles=1000, print_states=False
+    ):
+        """
+        运行多个Trapezoid流水线处理HBM格式的输入矩阵，将输入转换为BF16格式
+        
+        Args:
+            A_matrices: 稠密向量A的列表，每个元素是一个形状为(1, K)的numpy数组
+            B_data_list: 列表，每个元素是包含B矩阵CSR格式的字典
+            trapezoid_list: TrapezoidPipeline实例的列表
+            max_cycles: 最大运行周期数
+            print_states: 是否打印每个周期的状态
+            
+        Returns:
+            结果字典，包含运行结果和最终矩阵
+        """
+        print(f"🔄 转换输入数据为BF16格式...")
+        
+        # 将所有A矩阵转换为BF16格式
+        bf16_A_matrices = []
+        bf16_B_data_list = []
+
+        for B_data in B_data_list:
+            # 转换A矩阵（所有B_data共享同一个A矩阵）
+            A = A_matrices[0]
+            A_bf16 = np.zeros_like(A)
+            for i in range(A.shape[0]):
+                for j in range(A.shape[1]):
+                    if A[i, j] != 0:
+                        A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+            bf16_A_matrices.append(A_bf16)
+
+            # 转换B矩阵的values
+            values_B = B_data.get("values", [])
+            bf16_values_B = []
+            for val in values_B:
+                if val != 0:
+                    bf16_values_B.append(convert_through_pipeline(float(val)))
+                else:
+                    bf16_values_B.append(0)
+
+            # 创建新的B数据字典，保持col_indices和row_ptr不变
+            bf16_B_data = {
+                "values": bf16_values_B,
+                "col_indices": B_data.get("col_indices", []),
+                "row_ptr": B_data.get("row_ptr", []),
+                "row_start_index": B_data.get("row_start_index", 0)
+            }
+            bf16_B_data_list.append(bf16_B_data)
+
+        print(f"✅ BF16转换完成，开始多Trapezoid处理...")
+        
+        # 运行多Trapezoid流水线
+        return self.run_pipeline_hbm_multi(bf16_A_matrices, bf16_B_data_list, trapezoid_list, max_cycles, print_states)

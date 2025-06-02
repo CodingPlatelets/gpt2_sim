@@ -1,6 +1,7 @@
 import math
 from .advance_add_sim import AdvanceAddUnit
 from ..utils import find_singles, convert_through_pipeline
+from collections import deque
 
 class AddTree:
     def __init__(self, PE_num, c_values, M, N):
@@ -13,7 +14,7 @@ class AddTree:
         self.tree = self.create_tree()
 
         self.stage_valid_vec = [False] * (self.tree_levels + 1)
-        self.stage_output_vec = [[] for _ in range(self.tree_levels + 1)]
+        self.stage_output_vec = [deque() for _ in range(self.tree_levels + 1)]
         self.stage_evict_vec = [[] for _ in range(self.tree_levels + 1)]
 
     def create_tree(self):
@@ -52,12 +53,12 @@ class AddTree:
 
         for i in range(self.tree_levels - 1, -1, -1):
             add_layer_valid = False
-            self.stage_output_vec[i + 1] = []
+            self.stage_output_vec[i + 1] = deque()
             for add in self.tree[i]:
                 result = add.clock_cycle(
                     self.stage_valid_vec[i],
-                    self.stage_output_vec[i].pop(0) if self.stage_valid_vec[i] else [],
-                    self.stage_output_vec[i].pop(0) if self.stage_valid_vec[i] else [],
+                    self.stage_output_vec[i].popleft() if self.stage_valid_vec[i] and self.stage_output_vec[i] else [],
+                    self.stage_output_vec[i].popleft() if self.stage_valid_vec[i] and self.stage_output_vec[i] else [],
                     self.stage_evict_vec[i],
                 )
                 if result["valid"]:
@@ -65,28 +66,28 @@ class AddTree:
                     add_layer_valid = result["valid"]
             if add_layer_valid:
                 self.stage_evict_vec[i + 1] = self.get_level_evict_index(
-                    self.stage_output_vec[i + 1]
+                    list(self.stage_output_vec[i + 1])
                 )
                 self.stage_valid_vec[i + 1] = True
             else:
                 self.stage_evict_vec[i + 1] = []
-                self.stage_output_vec[i + 1] = []
+                self.stage_output_vec[i + 1] = deque()
                 self.stage_valid_vec[i + 1] = False
 
         self.stage_valid_vec[0] = valid
         if valid:
-            self.stage_output_vec[0] = map_queue.copy()
+            self.stage_output_vec[0] = deque(map_queue)
             self.stage_evict_vec[0] = self.get_level_evict_index(
-                self.stage_output_vec[0]
+                list(self.stage_output_vec[0])
             )
         else:
             self.stage_evict_vec[0] = []
-            self.stage_output_vec[0] = []
+            self.stage_output_vec[0] = deque()
 
         return {
             "cycle": self.cycle_count,
             "valid": self.stage_valid_vec[-1],  # 最后阶段的有效标志
-            "output": self.stage_output_vec[-1] if self.stage_valid_vec[-1] else None,
+            "output": list(self.stage_output_vec[-1]) if self.stage_valid_vec[-1] else None,
         }
 
     def reset(self):
@@ -97,7 +98,7 @@ class AddTree:
         self.stage_valid_vec = [False] * (self.tree_levels + 1)
 
         # 重置输出和驱逐索引向量
-        self.stage_output_vec = [[] for _ in range(self.tree_levels + 1)]
+        self.stage_output_vec = [deque() for _ in range(self.tree_levels + 1)]
         self.stage_evict_vec = [[] for _ in range(self.tree_levels + 1)]
 
         # 重置树中每个AdvanceAddUnit的状态

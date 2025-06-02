@@ -1,5 +1,6 @@
 from .compute_sim import AddUnit
 from ..utils import bf16_add, convert_through_pipeline
+from collections import deque
 
 
 class AdvanceAddUnit:
@@ -12,7 +13,8 @@ class AdvanceAddUnit:
         self.N = N
         self.add = AddUnit()
 
-        self.direct_value_index_map_queue = []
+        # 优化1: 使用deque替代list，提高pop(0)性能
+        self.direct_value_index_map_queue = deque()
 
         # stage1 get input and merge
         self.stage1_valid = False
@@ -62,25 +64,29 @@ class AdvanceAddUnit:
             )  # 也会包含stage2_valid=false的情况
 
         for _, values in self.stage2_merge_index_value_map.items():
-            if len(values) == 2:
+            values_len = len(values)
+            if values_len == 2:
                 add_used = True
-            if len(values) == 1:
+            elif values_len == 1:
                 no_add_used = True
 
-        case_AA = (add_used) and (no_add_used == False)
-        case_AB_A = (add_used == False) and (no_add_used)
+        case_AA = add_used and (not no_add_used)
+        case_AB_A = (not add_used) and no_add_used
         case_AAB = add_used and no_add_used
+        
         for index, values in self.stage2_merge_index_value_map.items():
-            assert len(values) <= 2
-            if len(values) == 2:
+            values_len = len(values)
+            assert values_len <= 2
+            if values_len == 2:
                 self.add.get_input(self.stage2_valid, values[0], values[1], index)
-            elif len(values) == 1:
+            elif values_len == 1:
                 if index not in temp:
                     temp[index] = []
                 temp[index].append(values[0])
-                # single_value_map = {index: [values[0]]}
+                
         if temp:  # 只有在temp非空时才添加
             self.direct_value_index_map_queue.append(temp.copy())
+            
         # padding
         if self.stage2_valid:
             if case_AA or case_None:
@@ -95,12 +101,13 @@ class AdvanceAddUnit:
         self.stage3_valid = self.add.valid
         if self.add.valid:
             index = self.add.index_queue.pop(0)
-            index_value_map = self.direct_value_index_map_queue.pop(0)
+            # 优化4: 使用popleft()替代pop(0)
+            index_value_map = self.direct_value_index_map_queue.popleft()
             if index != -2:
                 if index not in self.output:
                     self.output[index] = []
                 self.output[index].append(result)
-            if -2 not in index_value_map.keys():
+            if -2 not in index_value_map:
                 for index_s, values in index_value_map.items():
                     assert len(values) == 1
                     if index_s not in self.output:
@@ -116,11 +123,9 @@ class AdvanceAddUnit:
             for evict_index in self.stage1_evict_index_queue:
                 if evict_index in self.stage1_merge_index_value_map:
                     m = evict_index % self.M
-                    n = int(evict_index / self.M)
+                    n = evict_index // self.M  # 使用整数除法替代int(/)
                     assert len(self.stage1_merge_index_value_map[evict_index]) == 1
-                    evict_val = self.stage1_merge_index_value_map.pop(
-                        evict_index
-                    )  # 获取列表中的值
+                    evict_val = self.stage1_merge_index_value_map.pop(evict_index)
                     if evict_index != -1:
                         # self.c_values[m * self.N + n] += evict_val[0]
                         self.c_values[m * self.N + n] = bf16_add(
@@ -156,20 +161,20 @@ class AdvanceAddUnit:
         self.cycle_count = 0
 
         # 重置队列
-        self.direct_value_index_map_queue = []
+        self.direct_value_index_map_queue.clear()  # 优化9: 使用clear()替代重新赋值
 
         # 重置第一阶段
         self.stage1_valid = False
-        self.stage1_merge_index_value_map = {}
-        self.stage1_evict_index_queue = []
+        self.stage1_merge_index_value_map.clear()  # 优化10: 使用clear()
+        self.stage1_evict_index_queue.clear()
 
         # 重置第二阶段
         self.stage2_valid = False
-        self.stage2_merge_index_value_map = {}
+        self.stage2_merge_index_value_map.clear()
 
         # 重置第三阶段
         self.stage3_valid = False
-        self.output = {}
+        self.output.clear()
 
         # 重置加法单元
         self.add = AddUnit()
@@ -194,7 +199,7 @@ class AdvanceAddUnit:
                     self.add.index_queue if hasattr(self.add, "index_queue") else []
                 ),
             },
-            "direct_value_index_map_queue": self.direct_value_index_map_queue,
+            "direct_value_index_map_queue": list(self.direct_value_index_map_queue),  # 转换为list用于显示
         }
 
     def print_state(self):

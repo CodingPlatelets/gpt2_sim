@@ -86,6 +86,94 @@ def test_hbm_matrices():
         print("差异矩阵：")
         print(expected_C - result["c_matrix"])
 
+def test_hbm_small_matrices():
+    # 创建稀疏矩阵
+    np.random.seed(42)
+    M, K, N = 1, 128, 128
+
+    # 随机生成稀疏矩阵
+
+    A = np.random.choice([0, 1], size=(M, K), p=[0, 1])
+    B = np.random.choice([0, 1], size=(K, N), p=[0.9, 0.1])
+    print(B)
+    #M, K, N = 1, 4, 3
+    expected_C = naive_matmul(A, B)
+    pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=32)
+
+    hbm_data_lists = store_csr_in_simple_blocks(csr_matrix(B.T), 32)
+    print(hbm_data_lists)
+    print("\n运行流水线...")
+    start_time = time.time()
+    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists)
+    end_time = time.time()
+
+    # 打印结果
+    print(f"\n流水线运行完成，耗时: {(end_time - start_time)*1000:.2f}ms")
+    print(f"总周期数: {result['cycles']}")
+
+    print("\n预期结果矩阵：")
+    print(expected_C)
+
+    print("\n实际结果矩阵：")
+    print(result["c_matrix"])
+
+    # 验证结果
+    print("\n结果验证：")
+    if np.allclose(expected_C, result["c_matrix"], rtol=1e-2, atol=1e-2):
+        print("✓ 结果正确！")
+    else:
+        print("✗ 结果不匹配！")
+        print("差异矩阵：")
+        print(expected_C - result["c_matrix"])
+
+
+def test_hbm_multi_small_matrices():
+    # 创建稀疏矩阵
+    np.random.seed(42)
+    M, K, N = 1, 128, 128
+
+    # 随机生成稀疏矩阵
+
+    A = np.random.choice([0, 1], size=(M, K), p=[0, 1])
+    B = np.random.choice([0, 1], size=(K, N), p=[0.9, 0.1])
+    print(B)
+    #M, K, N = 1, 4, 3
+    expected_C = naive_matmul(A, B)
+
+    num_trapezoids = 4
+    trapezoid_list = []
+
+    for i in range(num_trapezoids):
+        trap = TrapezoidPipeline(M, K, N, 32)
+        trapezoid_list.append(trap)
+
+    main_trap = trapezoid_list[0]
+
+    hbm_data_lists = store_csr_in_simple_blocks(csr_matrix(B.T), 32)
+    #print(hbm_data_lists)
+    print("\n运行流水线...")
+    start_time = time.time()
+    result = main_trap.run_pipeline_hbm_multi_with_bf16([A], hbm_data_lists, trapezoid_list)
+    end_time = time.time()
+
+    # 打印结果
+    print(f"\n流水线运行完成，耗时: {(end_time - start_time)*1000:.2f}ms")
+    print(f"总周期数: {result['cycles']}")
+
+    print("\n预期结果矩阵：")
+    print(expected_C)
+
+    print("\n实际结果矩阵：")
+    print(result["combined_c_matrix"])
+
+    # 验证结果
+    print("\n结果验证：")
+    if np.allclose(expected_C, result["combined_c_matrix"], rtol=1e-2, atol=1e-2):
+        print("✓ 结果正确！")
+    else:
+        print("✗ 结果不匹配！")
+        print("差异矩阵：")
+        print(expected_C - result["combined_c_matrix"])
 
 def test_sparse_matrices():
     """测试稀疏矩阵乘法"""
@@ -253,4 +341,6 @@ def test_multiple_matrices():
 
 # test_sparse_matrices()
 # test_multiple_matrices()
-test_hbm_matrices()
+#test_hbm_matrices()
+test_hbm_small_matrices()
+test_hbm_multi_small_matrices()
