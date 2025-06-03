@@ -339,8 +339,8 @@ def test_multiple_matrices():
     return results
 
 
-# test_sparse_matrices()
+test_sparse_matrices()
 # test_multiple_matrices()
 #test_hbm_matrices()
-test_hbm_small_matrices()
-test_hbm_multi_small_matrices()
+#test_hbm_small_matrices()
+#test_hbm_multi_small_matrices()

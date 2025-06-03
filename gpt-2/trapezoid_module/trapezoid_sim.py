@@ -151,14 +151,14 @@ class TrapezoidPipeline:
                 start_index_val = self.start_index_queue.popleft()
             else:
                 start_index_val = 0
-                
+            
+            sft_index_a = self.stage2_index[0]
+            sft_index_b = self.stage2_index[1]
+
             if len(self.nums_rows_queue):
                 index_len = self.nums_rows_queue.popleft()
             else:
                 index_len = len(sft_index_b)
-            
-            sft_index_a = self.stage2_index[0]
-            sft_index_b = self.stage2_index[1]
             for sft_index in range(index_len):
                 sft_row_a = sft_index_a[sft_index]
                 sft_row_b = sft_index_b[sft_index]
