@@ -512,32 +512,54 @@ class TrapezoidPipeline:
         # 创建输入队列
         input_idx = 0
 
-        # 运行流水线，直到处理完所有输入并且没有更多有效数据
-        cycle = 0
-        while (
-            input_idx < len(input_matrices) or self.is_active()
-        ) and cycle < max_cycles:
-            # 获取当前周期的输入，如果有的话
-            if input_idx < len(input_matrices):
-                A, B = input_matrices[input_idx]
-                valid = True
-                input_idx += 1
-            else:
-                A, B = np.array([]), np.array([])
-                valid = False
+        # 估算总周期数：输入数据 + 流水线深度的缓冲
+        estimated_cycles = len(input_matrices) + 20  # 20是估算的流水线深度
+        
+        # 创建进度条
+        with tqdm(total=estimated_cycles, desc="流水线处理", unit="cycle") as pbar:
+            # 运行流水线，直到处理完所有输入并且没有更多有效数据
+            cycle = 0
+            while (
+                input_idx < len(input_matrices) or self.is_active()
+            ) and cycle < max_cycles:
+                # 获取当前周期的输入，如果有的话
+                if input_idx < len(input_matrices):
+                    A, B = input_matrices[input_idx]
+                    valid = True
+                    input_idx += 1
+                else:
+                    A, B = np.array([]), np.array([])
+                    valid = False
 
-            # 运行一个时钟周期
-            result = self.clock_cycle(valid, A, B)
-            results.append(result)
+                # 运行一个时钟周期
+                result = self.clock_cycle(valid, A, B)
+                results.append(result)
 
-            # 如果需要，打印当前状态
-            if print_states and (
-                cycle % 10 == 0 or cycle < 5 or cycle >= len(input_matrices) - 3
-            ):
-                print(f"\n--- 周期 {cycle + 1} ---")
-                self.print_state()
+                # 更新进度条
+                cycle += 1
+                
+                # 动态更新进度条描述
+                if input_idx < len(input_matrices):
+                    pbar.set_description(f"流水线处理 (输入 {input_idx}/{len(input_matrices)})")
+                else:
+                    pbar.set_description(f"流水线处理 (排空中)")
+                
+                # 如果超出估算周期数，扩展进度条
+                if cycle >= pbar.total:
+                    pbar.total = cycle + 10
+                    pbar.refresh()
+                
+                pbar.update(1)
 
-            cycle += 1
+                # 如果需要，打印当前状态
+                if print_states and (
+                    cycle % 10 == 0 or cycle < 5 or cycle >= len(input_matrices) - 3
+                ):
+                    # 暂时禁用进度条输出，打印状态，然后重新启用
+                    pbar.write(f"\n--- 周期 {cycle} ---")
+                    # 将状态信息写入到tqdm的输出中，避免与进度条冲突
+                    state_info = self.get_pipeline_state()
+                    pbar.write(f"流水线状态: 活跃阶段数 {sum(1 for stage in ['stage1', 'stage2', 'stage3', 'stage4', 'stage5'] if state_info['stages'][stage]['valid'])}")
 
         # 检查是否因为达到最大周期数而退出
         if cycle >= max_cycles and (
@@ -549,6 +571,8 @@ class TrapezoidPipeline:
         final_c_matrix = np.array([bf16_to_float(v) for v in self.c_values]).reshape(
             self.M, self.N
         )
+
+        print(f"✅ 流水线处理完成，总共 {cycle} 个周期")
 
         return {
             "results": results,
@@ -571,25 +595,32 @@ class TrapezoidPipeline:
         Returns:
             结果字典，包含运行结果和最终矩阵
         """
+        print(f"🔄 转换输入数据为BF16格式...")
+        
         # 将所有输入转换为BF16格式
         bf16_input_matrices = []
 
-        for A, B in input_matrices:
-            # 转换A矩阵
-            A_bf16 = np.zeros_like(A)
-            for i in range(A.shape[0]):
-                for j in range(A.shape[1]):
-                    if A[i, j] != 0:
-                        A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+        # 为转换过程添加进度条
+        with tqdm(total=len(input_matrices), desc="BF16转换", unit="matrix") as conv_pbar:
+            for A, B in input_matrices:
+                # 转换A矩阵
+                A_bf16 = np.zeros_like(A)
+                for i in range(A.shape[0]):
+                    for j in range(A.shape[1]):
+                        if A[i, j] != 0:
+                            A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
 
-            # 转换B矩阵
-            B_bf16 = np.zeros_like(B)
-            for i in range(B.shape[0]):
-                for j in range(B.shape[1]):
-                    if B[i, j] != 0:
-                        B_bf16[i, j] = convert_through_pipeline(float(B[i, j]))
+                # 转换B矩阵
+                B_bf16 = np.zeros_like(B)
+                for i in range(B.shape[0]):
+                    for j in range(B.shape[1]):
+                        if B[i, j] != 0:
+                            B_bf16[i, j] = convert_through_pipeline(float(B[i, j]))
 
-            bf16_input_matrices.append((A_bf16, B_bf16))
+                bf16_input_matrices.append((A_bf16, B_bf16))
+                conv_pbar.update(1)
+
+        print(f"✅ BF16转换完成")
 
         # 运行流水线
         return self.run_pipeline(bf16_input_matrices, max_cycles, print_states)

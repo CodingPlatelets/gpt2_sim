@@ -181,7 +181,7 @@ def test_sparse_matrices():
 
     # 创建稀疏矩阵
     np.random.seed(42)
-    M, K, N = 1, 1024, 1024
+    M, K, N = 1, 2048, 2048
 
     # 随机生成稀疏矩阵
 
@@ -199,7 +199,7 @@ def test_sparse_matrices():
     # 运行流水线
     print("\n运行流水线...")
     start_time = time.time()
-    result = pipeline.run_pipeline_with_bf16([(A, B)], print_states=False)
+    result = pipeline.run_pipeline_with_bf16([(A, B)], max_cycles=100000 ,print_states=False)
     end_time = time.time()
 
     # 打印结果摘要
