@@ -13,8 +13,8 @@ class MFIUPipelineDenseA:
         self.dense_A_precomputed = True
         
         # 其他初始化保持不变
-        self.shift_unit_pipeline_vec_a = [ShiftUnitPipeline() for _ in range(width)]
-        self.shift_unit_pipeline_vec_b = [ShiftUnitPipeline() for _ in range(width)]
+        self.shift_unit_pipeline_vec_a = [ShiftUnitPipeline(bit_width) for _ in range(self.width)]
+        self.shift_unit_pipeline_vec_b = [ShiftUnitPipeline(bit_width) for _ in range(self.width)]
         
         # 各个阶段的状态
         self.stage1_valid = False
@@ -75,6 +75,7 @@ class MFIUPipelineDenseA:
                 self.output[1].append(results_b["output"])
             else:
                 self.output = ([], [])
+
 
         # stage4 get ec_idx - 保持不变
         self.stage4_valid = self.stage3_valid

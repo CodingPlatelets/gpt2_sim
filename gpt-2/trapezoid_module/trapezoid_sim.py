@@ -758,18 +758,24 @@ class TrapezoidPipeline:
         Returns:
             结果字典，包含运行结果和最终矩阵
         """
-        # 将所有A矩阵转换为BF16格式
+        # 优化：A矩阵只转换一次
+        print(f"�� 转换A矩阵为BF16格式...")
+        A = A_matrices[0]
+        A_bf16 = np.zeros_like(A)
+        for i in range(A.shape[0]):
+            for j in range(A.shape[1]):
+                if A[i, j] != 0:
+                    A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+        
+        print(f"✅ A矩阵BF16转换完成")
+        
+        # 转换B矩阵数据
+        print(f"🔄 转换B矩阵数据为BF16格式...")
         bf16_A_matrices = []
         bf16_B_data_list = []
 
         for B_data in B_data_list:
-            # 转换A矩阵
-            A = A_matrices[0]
-            A_bf16 = np.zeros_like(A)
-            for i in range(A.shape[0]):
-                for j in range(A.shape[1]):
-                    if A[i, j] != 0:
-                        A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+            # 优化：直接使用已转换的A矩阵
             bf16_A_matrices.append(A_bf16)
 
             # 转换B矩阵的values
@@ -790,6 +796,8 @@ class TrapezoidPipeline:
             }
             bf16_B_data_list.append(bf16_B_data)
 
+        print(f"✅ BF16转换完成，开始HBM处理...")
+        
         # 运行流水线
         return self.run_pipeline_hbm(bf16_A_matrices, bf16_B_data_list, max_cycles, print_states)
 
@@ -962,18 +970,20 @@ class TrapezoidPipeline:
         """
         print(f"🔄 转换输入数据为BF16格式...")
         
+        # 优化：A矩阵只转换一次
+        A = A_matrices[0]
+        A_bf16 = np.zeros_like(A)
+        for i in range(A.shape[0]):
+            for j in range(A.shape[1]):
+                if A[i, j] != 0:
+                    A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+        
         # 将所有A矩阵转换为BF16格式
         bf16_A_matrices = []
         bf16_B_data_list = []
 
         for B_data in B_data_list:
-            # 转换A矩阵（所有B_data共享同一个A矩阵）
-            A = A_matrices[0]
-            A_bf16 = np.zeros_like(A)
-            for i in range(A.shape[0]):
-                for j in range(A.shape[1]):
-                    if A[i, j] != 0:
-                        A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+            # 优化：直接使用已转换的A矩阵
             bf16_A_matrices.append(A_bf16)
 
             # 转换B矩阵的values

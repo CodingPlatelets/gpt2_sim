@@ -78,9 +78,7 @@ def test_large_matrix_performance():
         start_time = time.time()
         try:
             dense_results = dense_mfiu.run_pipeline(
-                mask_A_rows=[masks_A], 
                 mask_B_cols=[masks_B], 
-                offset_A_rows=[offset_A],
                 offset_B_cols=[offset_B], 
                 len_values_A=len(values_A), 
                 len_values_B=len(values_B), 
@@ -179,8 +177,8 @@ def test_extreme_large_matrix():
     print("=" * 40)
     
     # 极大矩阵参数
-    M, K, N = 1, 512, 512
-    sparsity = 0.98  # 非常稀疏
+    M, K, N = 1, 4096, 4096
+    sparsity = 0.9  # 非常稀疏
     
     print(f"⚠️  即将测试 {M}×{K}×{N} 矩阵")
     print(f"⚠️  总元素数: {M*K + K*N:,}")
@@ -227,9 +225,7 @@ def test_extreme_large_matrix():
     try:
         with tqdm(total=100, desc="MFIU处理") as pbar:
             dense_results = dense_mfiu.run_pipeline(
-                mask_A_rows=[masks_A], 
                 mask_B_cols=[masks_B], 
-                offset_A_rows=[offset_A],
                 offset_B_cols=[offset_B], 
                 len_values_A=len(values_A), 
                 len_values_B=len(values_B), 

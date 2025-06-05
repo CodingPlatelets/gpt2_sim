@@ -11,7 +11,7 @@ def quick_performance_test():
     print("-" * 40)
     
     # 测试参数
-    M, K, N = 1, 8, 8
+    M, K, N = 1, 5, 5
     
     # 生成测试数据
     print(f"生成测试矩阵 ({M}x{K}) × ({K}x{N})...")
@@ -38,7 +38,7 @@ def quick_performance_test():
     start_time = time.time()
     original_results = original_mfiu.run_pipeline(
         [masks_A], [masks_B], [offset_A], [offset_B], 
-        len(values_A), len(values_B), max_cycles=30
+        len(values_A), len(values_B), max_cycles=30, print_states=False
     )
     original_time = time.time() - start_time
     
@@ -51,13 +51,12 @@ def quick_performance_test():
     
     start_time = time.time()
     dense_results = dense_mfiu.run_pipeline(
-        mask_A_rows=[masks_A], 
         mask_B_cols=[masks_B], 
-        offset_A_rows=[offset_A],
         offset_B_cols=[offset_B], 
         len_values_A=len(values_A), 
         len_values_B=len(values_B), 
-        max_cycles=30
+        max_cycles=30,
+        print_states=False
     )
     dense_time = time.time() - start_time
     
@@ -164,9 +163,7 @@ def test_mfiu_quick_fix():
     dense_mfiu = MFIUPipelineDenseA(width=width, bit_width=bit_width)
     start_time = time.time()
     dense_results = dense_mfiu.run_pipeline(
-        mask_A_rows=[mask_A],
         mask_B_cols=[mask_B],
-        offset_A_rows=[offset_A],
         offset_B_cols=[offset_B],
         len_values_A=len(values_A),
         len_values_B=len(values_B),

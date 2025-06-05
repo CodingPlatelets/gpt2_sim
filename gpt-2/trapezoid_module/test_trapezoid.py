@@ -49,7 +49,7 @@ def test_simple_case():
 def test_hbm_matrices():
     # 创建稀疏矩阵
     np.random.seed(42)
-    M, K, N = 1, 1024, 1024
+    M, K, N = 1, 4096, 4096
 
     # 随机生成稀疏矩阵
 
@@ -61,7 +61,7 @@ def test_hbm_matrices():
     pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=128)
 
     hbm_data_lists = store_csr_in_simple_blocks(csr_matrix(B.T), 256)
-    print(hbm_data_lists)
+    #print(hbm_data_lists)
     print("\n运行流水线...")
     start_time = time.time()
     result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists)
@@ -101,7 +101,7 @@ def test_hbm_small_matrices():
     pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=32)
 
     hbm_data_lists = store_csr_in_simple_blocks(csr_matrix(B.T), 32)
-    print(hbm_data_lists)
+    #print(hbm_data_lists)
     print("\n运行流水线...")
     start_time = time.time()
     result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists)
@@ -130,7 +130,7 @@ def test_hbm_small_matrices():
 def test_hbm_multi_small_matrices():
     # 创建稀疏矩阵
     np.random.seed(42)
-    M, K, N = 1, 128, 128
+    M, K, N = 1, 4096, 4096
 
     # 随机生成稀疏矩阵
 
@@ -140,7 +140,7 @@ def test_hbm_multi_small_matrices():
     #M, K, N = 1, 4, 3
     expected_C = naive_matmul(A, B)
 
-    num_trapezoids = 4
+    num_trapezoids = 128
     trapezoid_list = []
 
     for i in range(num_trapezoids):
@@ -153,7 +153,7 @@ def test_hbm_multi_small_matrices():
     #print(hbm_data_lists)
     print("\n运行流水线...")
     start_time = time.time()
-    result = main_trap.run_pipeline_hbm_multi_with_bf16([A], hbm_data_lists, trapezoid_list)
+    result = main_trap.run_pipeline_hbm_multi_with_bf16([A], hbm_data_lists, trapezoid_list, max_cycles=100000, print_states=False)
     end_time = time.time()
 
     # 打印结果
@@ -181,7 +181,7 @@ def test_sparse_matrices():
 
     # 创建稀疏矩阵
     np.random.seed(42)
-    M, K, N = 1, 2048, 2048
+    M, K, N = 1, 4096, 4096
 
     # 随机生成稀疏矩阵
 
@@ -339,8 +339,8 @@ def test_multiple_matrices():
     return results
 
 
-test_sparse_matrices()
+#test_sparse_matrices()
 # test_multiple_matrices()
 #test_hbm_matrices()
 #test_hbm_small_matrices()
-#test_hbm_multi_small_matrices()
+test_hbm_multi_small_matrices()
