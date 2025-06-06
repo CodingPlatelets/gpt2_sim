@@ -4,15 +4,19 @@ from .shift_sim import ShiftUnitPipeline
 class MFIUPipeline:
     def __init__(self, width=None, bit_width=None):
         # 基础配置
-        # TODO 处理 bit_width , width的输入，应该是一开始就确定的常量
+        # TODO width 其实可以是动态的
         self.width = width
         self.bit_width = bit_width
-        self.shift_unit_pipeline_vec_a = [
-            ShiftUnitPipeline(bit_width) for _ in range(self.width)
-        ]
-        self.shift_unit_pipeline_vec_b = [
-            ShiftUnitPipeline(bit_width) for _ in range(self.width)
-        ]
+        #self.shift_unit_pipeline_vec_a = [
+        #    ShiftUnitPipeline(bit_width) for _ in range(self.width)
+        #]
+        #self.shift_unit_pipeline_vec_b = [
+        #    ShiftUnitPipeline(bit_width) for _ in range(self.width)
+        #]
+
+        # 批量处理
+        self.shift_unit_pipeline_batch_process_a = ShiftUnitPipeline(bit_width)
+        self.shift_unit_pipeline_batch_process_b = ShiftUnitPipeline(bit_width)
 
         # stage1 处理输入，并进行一些预处理
 
@@ -20,10 +24,11 @@ class MFIUPipeline:
         self.stage1_valid = False
         self.stage1_len_values_A = 0
         self.stage1_len_values_B = 0
-        self.stage1_A_bit_mask_vec = [0] * self.width
-        self.stage1_B_bit_mask_vec = [0] * self.width
-        self.stage1_A_row_offset_vec = [0] * self.width
-        self.stage1_B_col_offset_vec = [0] * self.width
+        self.stage1_A_bit_mask_vec = []
+        self.stage1_B_bit_mask_vec = []
+        self.stage1_A_row_offset_vec = []
+        self.stage1_B_col_offset_vec = []
+        self.stage1_AB_width = 0
 
         # stage2 B bitmask & A bitmask
         self.stage2_valid = False
@@ -31,10 +36,11 @@ class MFIUPipeline:
 
         self.stage2_len_values_A = 0
         self.stage2_len_values_B = 0
-        self.stage2_A_bit_mask_vec = [0] * self.width
-        self.stage2_B_bit_mask_vec = [0] * self.width
-        self.stage2_A_row_offset_vec = [0] * self.width
-        self.stage2_B_col_offset_vec = [0] * self.width
+        self.stage2_A_bit_mask_vec = []
+        self.stage2_B_bit_mask_vec = []
+        self.stage2_A_row_offset_vec = []
+        self.stage2_B_col_offset_vec = []
+        self.stage2_AB_width = 0
 
         # stage3 prefix sum
         self.stage3_valid = False
@@ -43,27 +49,28 @@ class MFIUPipeline:
 
         self.stage3_len_values_A = 0
         self.stage3_len_values_B = 0
-        self.stage3_A_bit_mask_vec = [0] * self.width
-        self.stage3_B_bit_mask_vec = [0] * self.width
-        self.stage3_A_row_offset_vec = [0] * self.width
-        self.stage3_B_col_offset_vec = [0] * self.width
+        self.stage3_A_bit_mask_vec = []
+        self.stage3_B_bit_mask_vec = []
+        self.stage3_A_row_offset_vec = []
+        self.stage3_B_col_offset_vec = []
+        self.stage3_AB_width = 0
 
         # stage4 get ec_idx
         self.stage4_valid = False
-        self.stage4_ec_idx_vec = [[] for _ in range(self.width)]
+        self.stage4_ec_idx_vec = [[] for _ in range(self.stage3_AB_width)]
 
         self.stage4_len_values_A = 0
         self.stage4_len_values_B = 0
-        self.stage4_A_bit_mask_vec = [0] * self.width
-        self.stage4_B_bit_mask_vec = [0] * self.width
-        self.stage4_A_row_offset_vec = [0] * self.width
-        self.stage4_B_col_offset_vec = [0] * self.width
+        self.stage4_A_bit_mask_vec = []
+        self.stage4_B_bit_mask_vec = []
+        self.stage4_A_row_offset_vec = []
+        self.stage4_B_col_offset_vec = []
 
         # stage5 shift
         self.stage5_valid = False
 
         self.cycle_count = 0
-        self.output = ([], [])
+        self.output = [[], []]
 
     def clock_cycle(
         self,
@@ -79,7 +86,9 @@ class MFIUPipeline:
         self.cycle_count += 1
 
         # stage5 shift
-        self.output = ([], [])
+        
+        self.output = [[], []]
+        """
         for i, (shift_unit_a, shift_unit_b) in enumerate(
             zip(self.shift_unit_pipeline_vec_a, self.shift_unit_pipeline_vec_b)
         ):
@@ -103,6 +112,27 @@ class MFIUPipeline:
                 self.output[1].append(results_b["output"])
             else:
                 self.output = ([], [])
+        """
+        result_a = self.shift_unit_pipeline_batch_process_a.clock_cycle(
+            self.stage4_valid,
+            self.stage4_A_bit_mask_vec,
+            self.stage4_ec_idx_vec,
+            self.stage4_len_values_A,
+            self.stage4_A_row_offset_vec,
+        )
+        result_b = self.shift_unit_pipeline_batch_process_b.clock_cycle(
+            self.stage4_valid,
+            self.stage4_B_bit_mask_vec,
+            self.stage4_ec_idx_vec,
+            self.stage4_len_values_B,
+            self.stage4_B_col_offset_vec,
+        )
+        self.stage5_valid = result_a["valid"]
+        if self.stage5_valid:
+            self.output[0] = result_a["output"]
+            self.output[1] = result_b["output"]
+        else:
+            self.output = [[], []]
 
         # stage4 get ec_idx
         self.stage4_valid = self.stage3_valid
@@ -115,12 +145,16 @@ class MFIUPipeline:
         if self.stage3_valid:
             ec_idx_seq = np.where(
                 self.stage3_bit_seq, self.stage3_AB_prefix_sum, 0
-            ).tolist()
-            for i in range(self.width):
-                temp = []
-                for j in range(self.bit_width):
-                    temp.append(ec_idx_seq[i * self.bit_width + j])
-                self.stage4_ec_idx_vec[i] = temp
+            )
+            #for i in range(self.width):
+            #    start_idx = i * self.bit_width
+            #    end_idx = start_idx + self.bit_width
+            #    self.stage4_ec_idx_vec[i] = ec_idx_seq[start_idx : end_idx].tolist()
+            self.stage4_ec_idx_vec = [[] for _ in range(self.stage3_AB_width)]
+            for i in range(self.stage3_AB_width):
+                start_idx = i * self.bit_width
+                end_idx = start_idx + self.bit_width
+                self.stage4_ec_idx_vec[i] = ec_idx_seq[start_idx : end_idx].tolist()
         # stage3 prefix sum
         self.stage3_valid = self.stage2_valid
         self.stage3_len_values_A = self.stage2_len_values_A
@@ -130,6 +164,7 @@ class MFIUPipeline:
         self.stage3_A_row_offset_vec = self.stage2_A_row_offset_vec.copy()
         self.stage3_B_col_offset_vec = self.stage2_B_col_offset_vec.copy()
         self.stage3_bit_seq = self.stage2_bit_seq.copy()
+        self.stage3_AB_width = self.stage2_AB_width
         if self.stage2_valid:
             self.stage3_AB_prefix_sum = np.cumsum(self.stage2_bit_seq).tolist()
 
@@ -141,6 +176,7 @@ class MFIUPipeline:
         self.stage2_B_bit_mask_vec = self.stage1_B_bit_mask_vec.copy()
         self.stage2_A_row_offset_vec = self.stage1_A_row_offset_vec.copy()
         self.stage2_B_col_offset_vec = self.stage1_B_col_offset_vec.copy()
+        self.stage2_AB_width = self.stage1_AB_width
         if self.stage1_valid:
             AB_bit_vec = [
                 a & b
@@ -156,29 +192,33 @@ class MFIUPipeline:
         # stage1 处理输入，并进行一些预处理
         self.stage1_valid = valid
         if valid:
+            self.stage1_B_bit_mask_vec = []
+            self.stage1_B_col_offset_vec = []
+            self.stage1_A_bit_mask_vec = []
+            self.stage1_A_row_offset_vec = []
             self.stage1_len_values_A = len_values_A
             self.stage1_len_values_B = len_values_B
-            idx = 0
+            self.stage1_AB_width = len(mask_B_col) * len(mask_A_row)
             for i in range(len(mask_B_col)):
                 for j in range(len(mask_A_row)):
-                    self.stage1_B_bit_mask_vec[idx] = mask_B_col[i]
-                    self.stage1_B_col_offset_vec[idx] = offset_B_col[i]
-                    self.stage1_A_bit_mask_vec[idx] = mask_A_row[j]
-                    self.stage1_A_row_offset_vec[idx] = offset_A_row[j]
-                    idx += 1
+                    self.stage1_B_bit_mask_vec.append(mask_B_col[i])
+                    self.stage1_B_col_offset_vec.append(offset_B_col[i])
+                    self.stage1_A_bit_mask_vec.append(mask_A_row[j])
+                    self.stage1_A_row_offset_vec.append(offset_A_row[j])
+
         else:
             self.stage1_len_values_A = 0
             self.stage1_len_values_B = 0
-            self.stage1_A_bit_mask_vec = [0] * self.width
-            self.stage1_B_bit_mask_vec = [0] * self.width
-            self.stage1_A_row_offset_vec = [0] * self.width
-            self.stage1_B_col_offset_vec = [0] * self.width
+            self.stage1_A_bit_mask_vec = []
+            self.stage1_B_bit_mask_vec = []
+            self.stage1_A_row_offset_vec = []
+            self.stage1_B_col_offset_vec = []
 
         return {
             "cycle": self.cycle_count,
             "valid": self.stage5_valid,
             "output": self.output if self.stage5_valid else None,
-            "pipeline_state": self.get_pipeline_state(),
+            #"pipeline_state": self.get_pipeline_state(),
         }
 
     def is_active(self):
@@ -190,12 +230,10 @@ class MFIUPipeline:
             or self.stage5_valid
         ):
             return True
-        for shift in self.shift_unit_pipeline_vec_a:
-            if shift.is_active():
-                return True
-        for shift in self.shift_unit_pipeline_vec_b:
-            if shift.is_active():
-                return True
+        if self.shift_unit_pipeline_batch_process_a.is_active():
+            return True
+        if self.shift_unit_pipeline_batch_process_b.is_active():
+            return True
         return False
 
     def reset(self):
@@ -204,57 +242,54 @@ class MFIUPipeline:
         self.cycle_count = 0
 
         # 重置输出
-        self.output = ([], [])
+        self.output = [[], []]
 
         # 重置stage1状态
         self.stage1_valid = False
         self.stage1_len_values_A = 0
         self.stage1_len_values_B = 0
-        self.stage1_A_bit_mask_vec = [0] * self.width
-        self.stage1_B_bit_mask_vec = [0] * self.width
-        self.stage1_A_row_offset_vec = [0] * self.width
-        self.stage1_B_col_offset_vec = [0] * self.width
-
+        self.stage1_A_bit_mask_vec = []
+        self.stage1_B_bit_mask_vec = []
+        self.stage1_A_row_offset_vec = []
+        self.stage1_B_col_offset_vec = []
+        self.stage1_AB_width = 0
         # 重置stage2状态
         self.stage2_valid = False
         self.stage2_bit_seq = np.array([], dtype=int)
         self.stage2_len_values_A = 0
         self.stage2_len_values_B = 0
-        self.stage2_A_bit_mask_vec = [0] * self.width
-        self.stage2_B_bit_mask_vec = [0] * self.width
-        self.stage2_A_row_offset_vec = [0] * self.width
-        self.stage2_B_col_offset_vec = [0] * self.width
-
+        self.stage2_A_bit_mask_vec = []
+        self.stage2_B_bit_mask_vec = []
+        self.stage2_A_row_offset_vec = []
+        self.stage2_B_col_offset_vec = []
+        self.stage2_AB_width = 0
         # 重置stage3状态
         self.stage3_valid = False
         self.stage3_AB_prefix_sum = np.array([], dtype=int)
         self.stage3_bit_seq = np.array([], dtype=int)
         self.stage3_len_values_A = 0
         self.stage3_len_values_B = 0
-        self.stage3_A_bit_mask_vec = [0] * self.width
-        self.stage3_B_bit_mask_vec = [0] * self.width
-        self.stage3_A_row_offset_vec = [0] * self.width
-        self.stage3_B_col_offset_vec = [0] * self.width
-
+        self.stage3_A_bit_mask_vec = []
+        self.stage3_B_bit_mask_vec = []
+        self.stage3_A_row_offset_vec = []
+        self.stage3_B_col_offset_vec = []
+        self.stage3_AB_width = 0
         # 重置stage4状态
         self.stage4_valid = False
-        self.stage4_ec_idx_vec = [[] for _ in range(self.width)]
+        self.stage4_ec_idx_vec = [[] for _ in range(self.stage3_AB_width)]
         self.stage4_len_values_A = 0
         self.stage4_len_values_B = 0
-        self.stage4_A_bit_mask_vec = [0] * self.width
-        self.stage4_B_bit_mask_vec = [0] * self.width
-        self.stage4_A_row_offset_vec = [0] * self.width
-        self.stage4_B_col_offset_vec = [0] * self.width
-
+        self.stage4_A_bit_mask_vec = []
+        self.stage4_B_bit_mask_vec = []
+        self.stage4_A_row_offset_vec = []
+        self.stage4_B_col_offset_vec = []
+        self.stage4_AB_width = 0
         # 重置stage5状态
         self.stage5_valid = False
 
         # 重置所有ShiftUnitPipeline
-        for shift_unit in self.shift_unit_pipeline_vec_a:
-            shift_unit.reset()
-
-        for shift_unit in self.shift_unit_pipeline_vec_b:
-            shift_unit.reset()
+        self.shift_unit_pipeline_batch_process_a.reset()
+        self.shift_unit_pipeline_batch_process_b.reset()
 
     def get_pipeline_state(self):
         """返回流水线当前状态"""
@@ -313,8 +348,8 @@ class MFIUPipeline:
                 ),
             },
             "shift_units": {
-                "a_count": len(self.shift_unit_pipeline_vec_a),
-                "b_count": len(self.shift_unit_pipeline_vec_b),
+                "a_count": 1,
+                "b_count": 1,
             },
         }
 

@@ -155,13 +155,19 @@ class TrapezoidPipeline:
             sft_index_a = self.stage2_index[0]
             sft_index_b = self.stage2_index[1]
 
-            if len(self.nums_rows_queue):
-                index_len = self.nums_rows_queue.popleft()
-            else:
-                index_len = len(sft_index_b)
+            #assert len(sft_index_a) == len(sft_index_b)
+
+            #if len(self.nums_rows_queue):
+            #    index_len = self.nums_rows_queue.popleft()
+            #else:
+            #    index_len = len(sft_index_b)
+            index_len = len(sft_index_b)
             for sft_index in range(index_len):
                 sft_row_a = sft_index_a[sft_index]
                 sft_row_b = sft_index_b[sft_index]
+                #assert len(sft_row_a) == len(self.stage2_values_A) 
+                #assert len(sft_row_b) == len(self.stage2_values_B)
+
                 for i in range(len(sft_row_a)):
                     if sft_row_a[i] != 0:
                         self.stage3_mul_queue_a[

@@ -88,6 +88,6 @@ def test_mfiu_performance():
         print(f"\n🤔 优化效果不明显，可能需要进一步调整") 
     
 
-#test_MFIU()
+test_MFIU()
 #test_dense_MFIU()
-test_mfiu_performance()
+#test_mfiu_performance()

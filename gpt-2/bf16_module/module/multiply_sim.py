@@ -281,7 +281,7 @@ class BF16MultiplyPipeline:
         return {
             "cycle": self.cycle_count,
             "valid_output": self.stage5_valid,
-            "pipeline_state": self.get_pipeline_state(),
+            #"pipeline_state": self.get_pipeline_state(),
         }
 
     def get_pipeline_state(self):

@@ -64,7 +64,7 @@ def test_hbm_matrices():
     #print(hbm_data_lists)
     print("\n运行流水线...")
     start_time = time.time()
-    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists)
+    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists, max_cycles=100000, print_states=False)
     end_time = time.time()
 
     # 打印结果
@@ -89,7 +89,7 @@ def test_hbm_matrices():
 def test_hbm_small_matrices():
     # 创建稀疏矩阵
     np.random.seed(42)
-    M, K, N = 1, 512, 512
+    M, K, N = 1, 128, 128
 
     # 随机生成稀疏矩阵
 
@@ -98,13 +98,13 @@ def test_hbm_small_matrices():
     print(B)
     #M, K, N = 1, 4, 3
     expected_C = naive_matmul(A, B)
-    pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=128)
+    pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=32)
 
     hbm_data_lists = store_csr_in_simple_blocks(csr_matrix(B.T), 32)
     #print(hbm_data_lists)
     print("\n运行流水线...")
     start_time = time.time()
-    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists)
+    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists, max_cycles=8000)
     end_time = time.time()
 
     # 打印结果

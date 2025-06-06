@@ -9,26 +9,26 @@ class ShiftUnitPipeline:
 
         # stage1 获取输入
         self.stage1_valid = False
-        self.stage1_bit_mask = 0
-        self.stage1_ec_idx = []
+        self.stage1_bit_masks = []
+        self.stage1_ec_idxs = []
         self.stage1_values_len = 0
-        self.stage1_offset = 0
+        self.stage1_offsets = []
 
         # stage2 统计0元
         self.stage2_zero_count = []
         self.stage2_valid = False
-        self.stage2_offset = 0
-        self.stage2_ec_idx = []
+        self.stage2_offsets = []
+        self.stage2_ec_idxs = []
         self.stage2_values_len = 0
-        self.stage2_bit_mask = 0
+        self.stage2_bit_masks = []
 
         # stage3 得到zero count bit
         self.stage3_valid = False
         self.stage3_zero_count_bit_vec = [[] for _ in range(self.min_bits_num)]
-        self.stage3_offset = 0
-        self.stage3_ec_idx = []
+        self.stage3_offsets = []
+        self.stage3_ec_idxs = []
         self.stage3_values_len = 0
-        self.stage3_bit_mask = 0
+        self.stage3_bit_masks = []
 
         # stage4 shift
         self.stage4_valid = False
@@ -42,35 +42,36 @@ class ShiftUnitPipeline:
         # 重置所有阶段状态
         # stage1 获取输入
         self.stage1_valid = False
-        self.stage1_bit_mask = 0
-        self.stage1_ec_idx = []
+        self.stage1_bit_masks = []
+        self.stage1_ec_idxs = []
         self.stage1_values_len = 0
-        self.stage1_offset = 0
+        self.stage1_offsets = []
 
         # stage2 统计0元
         self.stage2_zero_count = []
         self.stage2_valid = False
-        self.stage2_offset = 0
-        self.stage2_ec_idx = []
+        self.stage2_offsets = []
+        self.stage2_ec_idxs = []
         self.stage2_values_len = 0
-        self.stage2_bit_mask = 0
+        self.stage2_bit_masks = []
 
         # stage3 得到zero count bit
         self.stage3_valid = False
         self.stage3_zero_count_bit_vec = [[] for _ in range(self.min_bits_num)]
-        self.stage3_offset = 0
-        self.stage3_ec_idx = []
+        self.stage3_offsets = []
+        self.stage3_ec_idxs = []
         self.stage3_values_len = 0
-        self.stage3_bit_mask = 0
+        self.stage3_bit_masks = []
 
         # stage4 shift
         self.stage4_valid = False
+        self.stage4_values_len = 0 # for debug
 
         # 重置输出和计数器
         self.output = []
         self.cycle_count = 0
 
-    def clock_cycle(self, valid, bit_mask, ec_idx, values_len, offset):
+    def clock_cycle(self, valid, bit_masks, ec_idxs, values_len, offsets):
         """
         执行一个时钟周期的流水线操作
 
@@ -82,6 +83,7 @@ class ShiftUnitPipeline:
         # 阶段4 处理右移
         self.stage4_valid = self.stage3_valid
         if self.stage3_valid:
+            self.stage4_values_len = self.stage3_values_len
             #hifted_ec_idx = self.stage3_ec_idx.copy()
 
             #or bit_level in range(self.min_bits_num):
@@ -101,41 +103,44 @@ class ShiftUnitPipeline:
             #   target_idx = i + self.stage3_offset
             #   if target_idx < self.stage3_values_len:
             #       self.output[target_idx] = shifted_ec_idx[i]
-
-            bit_width = len(self.stage3_ec_idx)
-            
-            # 直接基于mask提取有效索引
-            valid_indices = []
-            valid_positions = []
-            
-            for i in range(bit_width):
-                bit = (self.stage3_bit_mask >> (bit_width - 1 - i)) & 1
-                if bit == 1:
-                    valid_indices.append(self.stage3_ec_idx[i])
-                    valid_positions.append(i)
-            
-            #print(f"  优化版 - 有效位置: {valid_positions}")
-            #print(f"  优化版 - 有效索引: {valid_indices}")
-            
-            # 计算移位后的位置
-            result = [0] * self.stage3_values_len
-            
-            # ✅ 修复：使用self.stage3_offset而不是函数参数offset
-            result_pos = self.stage3_offset
-            for idx in valid_indices:
-                if result_pos < self.stage3_values_len:
-                    result[result_pos] = idx
-                    result_pos += 1
-            
-            self.output = result
-
+            self.output = []
+            for iter in range(len(self.stage3_bit_masks)):
+                bit_width = len(self.stage3_ec_idxs[iter])
+                
+                # 直接基于mask提取有效索引
+                valid_indices = []
+                valid_positions = []
+                
+                for i in range(bit_width):
+                    bit = (self.stage3_bit_masks[iter] >> (bit_width - 1 - i)) & 1
+                    if bit == 1:
+                        valid_indices.append(self.stage3_ec_idxs[iter][i])
+                        valid_positions.append(i)
+                
+                #print(f"  优化版 - 有效位置: {valid_positions}")
+                #print(f"  优化版 - 有效索引: {valid_indices}")
+                
+                # 计算移位后的位置
+                result = [0] * self.stage3_values_len
+                
+                # ✅ 修复：使用self.stage3_offset而不是函数参数offset
+                result_pos = self.stage3_offsets[iter]
+                for idx in valid_indices:
+                    if result_pos < self.stage3_values_len:
+                        result[result_pos] = idx
+                        result_pos += 1
+                
+                self.output.append(result)
+                #print(f"len(result): {len(result)}")
+                #print(f"self.stage4_values_len: {self.stage3_values_len}")
+                #assert len(result) == self.stage4_values_len
         # 阶段3: get 0 bit
 
         self.stage3_valid = self.stage2_valid
-        self.stage3_offset = self.stage2_offset
-        self.stage3_ec_idx = self.stage2_ec_idx.copy()
+        self.stage3_offsets = self.stage2_offsets
+        self.stage3_ec_idxs = self.stage2_ec_idxs
         self.stage3_values_len = self.stage2_values_len
-        self.stage3_bit_mask = self.stage2_bit_mask
+        self.stage3_bit_masks = self.stage2_bit_masks
         if self.stage2_valid:
             #zero_count_bit_vec = [[] for _ in range(self.min_bits_num)]
 
@@ -152,10 +157,10 @@ class ShiftUnitPipeline:
 
         # 阶段2: 统计0元
         self.stage2_valid = self.stage1_valid
-        self.stage2_offset = self.stage1_offset
+        self.stage2_offsets = self.stage1_offsets
         self.stage2_values_len = self.stage1_values_len
-        self.stage2_ec_idx = self.stage1_ec_idx.copy()
-        self.stage2_bit_mask = self.stage1_bit_mask
+        self.stage2_ec_idxs = self.stage1_ec_idxs
+        self.stage2_bit_masks = self.stage1_bit_masks
 
         if self.stage1_valid:
             #zero_count = []
@@ -172,27 +177,27 @@ class ShiftUnitPipeline:
         self.stage1_valid = valid
         if (
             valid
-            and bit_mask is not None
-            and ec_idx is not None
+            and bit_masks is not None
+            and ec_idxs is not None
             and values_len is not None
-            and offset is not None
+            and offsets is not None
         ):
-            self.stage1_bit_mask = bit_mask
-            self.stage1_ec_idx = ec_idx.copy()
+            self.stage1_bit_masks = bit_masks
+            self.stage1_ec_idxs = ec_idxs
             self.stage1_values_len = values_len
-            self.stage1_offset = offset
+            self.stage1_offsets = offsets
 
         else:
-            self.stage1_bit_mask = 0
-            self.stage1_ec_idx = []
+            self.stage1_bit_masks = []
+            self.stage1_ec_idxs = []
             self.stage1_values_len = 0
-            self.stage1_offset = 0
+            self.stage1_offsets = []
 
         return {
             "cycle": self.cycle_count,
             "valid": self.stage4_valid,
             "output": self.output if self.stage4_valid else None,
-            "pipeline_state": self.get_pipeline_state(),
+            #"pipeline_state": self.get_pipeline_state(),
         }
 
     def is_active(self):
@@ -208,34 +213,24 @@ class ShiftUnitPipeline:
         return {
             "stage1": {
                 "valid": self.stage1_valid,
-                "bit_mask": (
-                    bin(self.stage1_bit_mask)[2:].zfill(self.bit_width)
-                    if self.stage1_valid
-                    else "invalid"
-                ),
-                "ec_idx_len": len(self.stage1_ec_idx) if self.stage1_valid else 0,
+                "bit_masks": self.stage1_bit_masks if self.stage1_valid else "invalid",
+                "ec_idx_len": len(self.stage1_ec_idxs) if self.stage1_valid else 0,
                 "values_len": self.stage1_values_len if self.stage1_valid else 0,
-                "offset": self.stage1_offset if self.stage1_valid else "invalid",
+                "offset": self.stage1_offsets if self.stage1_valid else "invalid",
             },
             "stage2": {
                 "valid": self.stage2_valid,
-                "zero_count": (
-                    self.stage2_zero_count if self.stage2_valid else "invalid"
-                ),
-                "ec_idx_len": len(self.stage2_ec_idx) if self.stage2_valid else 0,
+                "zero_count": self.stage2_zero_count if self.stage2_valid else "invalid",
+                "ec_idx_len": len(self.stage2_ec_idxs) if self.stage2_valid else 0,
                 "values_len": self.stage2_values_len if self.stage2_valid else 0,
-                "offset": self.stage2_offset if self.stage2_valid else "invalid",
+                "offset": self.stage2_offsets if self.stage2_valid else "invalid",
             },
             "stage3": {
                 "valid": self.stage3_valid,
-                "bit_vectors": (
-                    [v for v in self.stage3_zero_count_bit_vec]
-                    if self.stage3_valid
-                    else "invalid"
-                ),
-                "ec_idx_len": len(self.stage3_ec_idx) if self.stage3_valid else 0,
+                "bit_vectors": self.stage3_zero_count_bit_vec if self.stage3_valid else "invalid",
+                "ec_idx_len": len(self.stage3_ec_idxs) if self.stage3_valid else 0,
                 "values_len": self.stage3_values_len if self.stage3_valid else 0,
-                "offset": self.stage3_offset if self.stage3_valid else "invalid",
+                "offset": self.stage3_offsets if self.stage3_valid else "invalid",
             },
             "stage4": {
                 "valid": self.stage4_valid,

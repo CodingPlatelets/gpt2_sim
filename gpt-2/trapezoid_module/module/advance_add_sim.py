@@ -153,7 +153,7 @@ class AdvanceAddUnit:
             "cycle": self.cycle_count,
             "valid": self.stage3_valid,
             "output": self.output if self.stage3_valid else None,
-            "pipeline_state": self.get_pipeline_state(),
+            #"pipeline_state": self.get_pipeline_state(),
         }
 
     def reset(self):

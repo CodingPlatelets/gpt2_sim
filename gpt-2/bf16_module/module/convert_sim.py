@@ -112,7 +112,7 @@ class FP32toBF16Pipeline:
             "cycle": self.cycle_count,
             "valid_out": self.stage3_valid,
             "bf16_out": self.stage3_bf16 if self.stage3_valid else None,
-            "pipeline_state": self.get_pipeline_state(),
+            #"pipeline_state": self.get_pipeline_state(),
         }
 
     def get_pipeline_state(self):
