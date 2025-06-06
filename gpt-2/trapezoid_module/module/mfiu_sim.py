@@ -121,7 +121,6 @@ class MFIUPipeline:
                 for j in range(self.bit_width):
                     temp.append(ec_idx_seq[i * self.bit_width + j])
                 self.stage4_ec_idx_vec[i] = temp
-
         # stage3 prefix sum
         self.stage3_valid = self.stage2_valid
         self.stage3_len_values_A = self.stage2_len_values_A
