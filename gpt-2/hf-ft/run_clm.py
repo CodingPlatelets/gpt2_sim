@@ -31,7 +31,7 @@ from typing import Optional
 import datasets
 import evaluate
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 import transformers
 from transformers import (
@@ -52,6 +52,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
+from model_gpt2 import GPT2LMHeadModel
 from transformers.models.gpt2 import modeling_gpt2
 from model import GPT2AttentionXWWX,GPT2AttentionOri
 
@@ -307,14 +308,15 @@ def main():
     # download the dataset.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            cache_dir=model_args.cache_dir,
-            token=model_args.token,
-            streaming=data_args.streaming,
-            trust_remote_code=model_args.trust_remote_code,
-        )
+        # raw_datasets = load_dataset(
+        #     data_args.dataset_name,
+        #     data_args.dataset_config_name,
+        #     cache_dir=model_args.cache_dir,
+        #     token=model_args.token,
+        #     streaming=data_args.streaming,
+        #     trust_remote_code=model_args.trust_remote_code,
+        # )
+        raw_datasets = load_from_disk(data_args.dataset_name)
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
@@ -429,7 +431,8 @@ def main():
         # 更换ATTN
         # modeling_gpt2.GPT2Attention = GPT2AttentionXWWX
         # modeling_gpt2.GPT2Attention = GPT2AttentionOri
-        model = AutoModelForCausalLM.from_pretrained(
+
+        model = GPT2LMHeadModel.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
@@ -441,17 +444,19 @@ def main():
             low_cpu_mem_usage=model_args.low_cpu_mem_usage,
         )
 
-
+        # print(model.config.use_cache)
+        # model.config.use_cache = False
+        # print(model.config.use_cache)
     else:
         # 更换ATTN
         # modeling_gpt2.GPT2Attention = GPT2AttentionXWWX
         # modeling_gpt2.GPT2Attention = GPT2AttentionOri
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+        model = GPT2LMHeadModel.from_config(config, trust_remote_code=model_args.trust_remote_code)
 
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params / 2**20:.2f}M params")
 
-    print(model)
+    # print(model)
 
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
@@ -585,6 +590,7 @@ def main():
             return logits.argmax(dim=-1)
 
         metric = evaluate.load("./metrics/accuracy", cache_dir=model_args.cache_dir)
+        # metric = evaluate.load("./metrics/perplexity", cache_dir=model_args.cache_dir)
 
         def compute_metrics(eval_preds):
             preds, labels = eval_preds

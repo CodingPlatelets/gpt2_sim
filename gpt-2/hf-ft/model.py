@@ -17,6 +17,7 @@ from transformers.models.gpt2.modeling_gpt2 import (
 from transformers.models.gpt2 import modeling_gpt2
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
+import numpy as np
 
 logger = logging.get_logger(__name__)
 
@@ -347,118 +348,6 @@ class GPT2AttentionXWWX(nn.Module):
         # 初始化一个空集合，用于存储已修剪的头。
         self.pruned_heads = set()
 
-    # 修剪头部。（（未使用
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        # 找到可修剪的头和索引。
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.num_heads, self.head_dim, self.pruned_heads
-        )
-        # 将索引连接起来。
-        index_attn = torch.cat(
-            [index, index + self.split_size, index + (2 * self.split_size)]
-        )
-        # 修剪卷积层。
-        # Prune conv1d layers
-        self.c_attn = prune_conv1d_layer(self.c_attn, index_attn, dim=1)
-        self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
-        # 更新超参数。
-        # Update hyper params
-        self.split_size = (self.split_size // self.num_heads) * (
-            self.num_heads - len(heads)
-        )
-        self.num_heads = self.num_heads - len(heads)
-        self.pruned_heads = self.pruned_heads.union(heads)
-
-    # 上转换和重新排序注意力。（（未使用
-    def _upcast_and_reordered_attn(
-        self, query, key, value, attention_mask=None, head_mask=None
-    ):
-        # 使用 `torch.baddbmm`（一个更高效的alpha参数用于缩放--来自Megatron-LM）
-        # 获取输入形状。bsz: batch_size, num_heads: 头数, q_seq_len: 查询序列长度, dk: 每个头维度
-        bsz, num_heads, q_seq_len, dk = query.size()
-        # 获取键序列长度。
-        _, _, k_seq_len, _ = key.size()
-        # 预分配attn_weights用于`baddbmm`
-        # attn_weights = torch.empty(
-        #     bsz * num_heads, q_seq_len, k_seq_len, dtype=torch.float32, device=query.device)
-        # 计算缩放因子。
-        scale_factor = 1.0
-        if self.scale_attn_weights:
-            scale_factor /= float(value.size(-1)) ** 0.5
-        # 如果需要，按层级缩放。
-        if self.scale_attn_by_inverse_layer_idx:
-            scale_factor /= float(self.layer_idx + 1)
-        # 关闭自动计算并重新排序（缩放K为1/根号(dk)）
-        # Upcast (turn off autocast) and reorder (Scale K by 1 / root(dk))
-        # with torch.amp.autocast(query.device.type, enabled=False):
-        # q k^T
-        q, k = query.reshape(-1, q_seq_len, dk), key.transpose(-1, -2).reshape(
-            -1, dk, k_seq_len
-        )
-        # 使用baddbmm进行批量矩阵乘法，计算Q·K^T
-        # attn_weights = torch.baddbmm(
-        #     attn_weights, q.float(), k.float(), beta=0, alpha=scale_factor)
-
-        attn_weights = torch.matmul(q, k)
-
-        attn_weights = attn_weights * scale_factor
-
-        # # 重塑回原始形状
-        attn_weights = attn_weights.reshape(
-            bsz, num_heads, q_seq_len, k_seq_len)
-        # 对于自注意力，应用因果掩码
-        if not self.is_cross_attention:
-            # if only "normal" attention layer implements causal mask
-            # 序列长度
-            query_length, key_length = query.size(-2), key.size(-2)
-            # 计算因果掩码
-            causal_mask = self.bias[
-                :, :, key_length - query_length: key_length, :key_length
-            ]
-            # 获取掩码值（负无穷大）
-            mask_value = torch.finfo(attn_weights.dtype).min
-            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            mask_value = torch.tensor(
-                mask_value, dtype=attn_weights.dtype, device=attn_weights.device
-            )
-            # 应用掩码
-            attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-        # 应用额外的注意力掩码（如果提供）
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
-        # 应用softmax得到注意力权重
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op if otherwise
-        if attn_weights.dtype != torch.float32:
-            raise RuntimeError(
-                "Error with upcasting, attn_weights does not have dtype torch.float32"
-            )
-
-        # 转换数据类型
-        attn_weights = attn_weights.type(value.dtype)
-        # 应用dropout
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # Mask heads if we want to
-        # 应用头部掩码（如果提供）
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
-
-        # 计算注意力输出
-        # attn_weights: [bsz,num_heads,q_seq_len,k_seq_len]
-        # value: [bsz,num_heads,k_seq_len,head_dim]
-        # attn_output: [bsz,num_heads,q_seq_len,head_dim]
-        attn_output = torch.matmul(attn_weights, value)
-        attn_output = attn_output.transpose(1, 2)
-        # attn_output: [bsz,q_seq_len,num_heads,head_dim]
-
-        return attn_output, attn_weights
-
     # 新的注意力计算方法
     def _xwwx_attn_bias(
         self,
@@ -494,7 +383,15 @@ class GPT2AttentionXWWX(nn.Module):
                 self.split_size, dim=0)
 
             encoder_hidden_states = hidden_states
-            
+
+        # 计算70%分位数作为阈值
+        threshold = torch.quantile(encoder_hidden_states.abs().flatten(), 0.50)
+        encoder_hidden_states = torch.where(
+            encoder_hidden_states.abs() < threshold,
+            torch.zeros_like(encoder_hidden_states),
+            encoder_hidden_states
+        ) 
+        
         # 如果启用bf16，转换精度
         if use_bf16 and torch.cuda.is_available():
             # 转换权重和偏置
@@ -514,23 +411,23 @@ class GPT2AttentionXWWX(nn.Module):
         # step1 计算query = x·w_q + q_bias 以及 value = x·w_v + v_bias
         # x:[bsz, q/k_seq_len, embed_dim] ,w_q/k:[embed_dim, embed_dim], q/k_bias:[embed_dim,]
         query_states = torch.matmul(hidden_states, w_q) + q_bias
-        value_states = torch.matmul(encoder_hidden_states, w_v) + v_bias
+        # value_states = torch.matmul(encoder_hidden_states, w_v) + v_bias
 
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         query = query_states.view(shape_q).transpose(
             1, 2)  # [bsz, num_heads, q_seq_len,  head_dim]
 
-        shape_v = (*value_states.shape[:-1], -1, self.head_dim)
-        value = value_states.view(shape_v).transpose(
-            1, 2)  # [bsz, num_heads, k_seq_len,  head_dim]
+        # shape_v = (*value_states.shape[:-1], -1, self.head_dim)
+        # value = value_states.view(shape_v).transpose(
+        #     1, 2)  # [bsz, num_heads, k_seq_len,  head_dim]
 
         bsz, num_heads, q_seq_len, dk = query.size()
-        _, _, k_seq_len, _ = value.size()
+        _,k_seq_len,_ = encoder_hidden_states.size()
 
         # 计算缩放因子。
         scale_factor = 1.0
         if self.scale_attn_weights:
-            scale_factor /= float(value.size(-1)) ** 0.5
+            scale_factor /= float(query.size(-1)) ** 0.5
         # 如果需要，按层级缩放。
         if self.scale_attn_by_inverse_layer_idx:
             scale_factor /= float(self.layer_idx + 1)
@@ -556,14 +453,11 @@ class GPT2AttentionXWWX(nn.Module):
         # scale
         attn_weights = attn_weights * scale_factor
         
-        # 如果使用了bf16，将结果转回原始精度用于后续处理
-        if use_bf16 and torch.cuda.is_available():
-            attn_weights = attn_weights.to(torch.float32)
-
         # 对于自注意力，应用因果掩码
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
             query_length, key_length = q_seq_len, k_seq_len
+            # print(f"query_length: {query_length}, key_length: {key_length}")
             # 计算因果掩码
             causal_mask = self.bias[
                 :, :, key_length - query_length: key_length, :key_length
@@ -582,6 +476,20 @@ class GPT2AttentionXWWX(nn.Module):
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
 
+        # # 在评估时保存第4层的完整注意力矩阵（在softmax之前）
+        # if self.layer_idx == 3 and not self.training:  # 只在评估时保存
+        #     if not hasattr(self, 'saved_scores'):
+        #         self.saved_scores = False
+            
+        #     # 只在最后一个token时保存一次完整的注意力矩阵
+        #     if not self.saved_scores and q_seq_len == k_seq_len:
+        #         scores_np = attn_weights.detach().cpu().numpy()
+        #         # 保存为npy格式
+        #         save_path = 'scores_layer4_before_softmax.npy'
+        #         np.save(save_path, scores_np)
+        #         print(f"已保存第4层注意力矩阵到: {save_path}")
+        #         self.saved_scores = True  # 标记已经保存过
+
         # 应用softmax得到注意力权重
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -592,7 +500,7 @@ class GPT2AttentionXWWX(nn.Module):
             )
 
         # 转换数据类型
-        attn_weights = attn_weights.type(value.dtype)
+        attn_weights = attn_weights.type(encoder_hidden_states.dtype)
         # 应用dropout
         attn_weights = self.attn_dropout(attn_weights)
 
@@ -601,15 +509,26 @@ class GPT2AttentionXWWX(nn.Module):
             attn_weights = attn_weights * head_mask
 
         # attn_weights: [bsz,num_heads,q_seq_len,k_seq_len]
-        # value: [bsz,num_heads,k_seq_len,head_dim]
-        # attn_output: [bsz,num_heads,q_seq_len,head_dim]
-        attn_output = torch.matmul(attn_weights, value)
-        attn_output = attn_output.transpose(1, 2)
-        # attn_output: [bsz,q_seq_len,num_heads,head_dim]
+        # encoder_hidden_states: [bsz,k_seq_len,embed_dim]
+        # 将encoder_hidden_states转换为多头形式
+        encoder_hidden_states = encoder_hidden_states.unsqueeze(1).expand(-1, num_heads, -1, -1)
+        # encoder_hidden_states: [bsz,num_heads,k_seq_len,embed_dim]
+        Scoresx = torch.matmul(attn_weights, encoder_hidden_states)
+        # Scoresx: [bsz,num_heads,q_seq_len,embed_dim]
         
-        # 如果使用了bf16，将输出转回原始精度
-        if use_bf16 and torch.cuda.is_available():
-            attn_output = attn_output.to(torch.float32)
+        # w_v: [embed_dim,embed_dim]
+        Wv_heads = w_v.view(self.embed_dim, self.num_heads, self.head_dim)
+        # Wv_heads: [embed_dim,num_heads,head_dim]
+
+        # v_bias: [embed_dim,]
+        v_bias_heads = v_bias.reshape(1, 1, self.num_heads, self.head_dim).expand(bsz, k_seq_len, -1, -1).transpose(1, 2)
+        # v_bias_heads: [bsz,num_heads,q_seq_len,head_dim]
+
+        # attn_output: [bsz,num_heads,q_seq_len,embed_dim]
+        attn_output = torch.einsum('bnsd,dnt->bnst', Scoresx, Wv_heads) + v_bias_heads
+
+        attn_output = attn_output.transpose(1, 2)
+        # attn_output: [bsz,q_seq_len,num_heads,embed_dim]
 
         return attn_output, attn_weights
 
@@ -643,8 +562,29 @@ class GPT2AttentionXWWX(nn.Module):
         # attn_output:[bsz,q_seq_len,hid_dim]
         # 应用残差连接和dropout
         attn_output = self.resid_dropout(attn_output)
-        # present 缓存的K、V
-        present = None
+        
+        # 处理 present 值
+        if use_cache:
+            # 计算当前的 key 和 value 状态
+            if encoder_hidden_states is not None:
+                key_states, value_states = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
+            else:
+                _, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            
+            # 重塑为多头形式
+            key_states = key_states.view(*key_states.shape[:-1], -1, self.head_dim).transpose(1, 2)
+            value_states = value_states.view(*value_states.shape[:-1], -1, self.head_dim).transpose(1, 2)
+            
+            # 如果有过去的缓存，将其与当前的K、V拼接
+            if layer_past is not None:
+                past_key, past_value = layer_past
+                key_states = torch.cat((past_key, key_states), dim=-2)
+                value_states = torch.cat((past_value, value_states), dim=-2)
+            
+            present = (key_states, value_states)
+        else:
+            present = None
+            
         outputs = (attn_output, present)
         if output_attentions:
             outputs += (attn_weights,)
@@ -710,119 +650,6 @@ class GPT2AttentionOri(nn.Module):
         # 初始化一个空集合，用于存储已修剪的头。
         self.pruned_heads = set()
 
-    # 修剪头部。（（未使用
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        # 找到可修剪的头和索引。
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.num_heads, self.head_dim, self.pruned_heads
-        )
-        # 将索引连接起来。
-        index_attn = torch.cat(
-            [index, index + self.split_size, index + (2 * self.split_size)]
-        )
-        # 修剪卷积层。
-        # Prune conv1d layers
-        self.c_attn = prune_conv1d_layer(self.c_attn, index_attn, dim=1)
-        self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
-        # 更新超参数。
-        # Update hyper params
-        self.split_size = (self.split_size // self.num_heads) * (
-            self.num_heads - len(heads)
-        )
-        self.num_heads = self.num_heads - len(heads)
-        self.pruned_heads = self.pruned_heads.union(heads)
-
-    # 上转换和重新排序注意力。（（未使用
-    def _upcast_and_reordered_attn(
-        self, query, key, value, attention_mask=None, head_mask=None
-    ):
-        # 使用 `torch.baddbmm`（一个更高效的alpha参数用于缩放--来自Megatron-LM）
-        # 获取输入形状。bsz: batch_size, num_heads: 头数, q_seq_len: 查询序列长度, dk: 每个头维度
-        bsz, num_heads, q_seq_len, dk = query.size()
-        # 获取键序列长度。
-        _, _, k_seq_len, _ = key.size()
-        # 预分配attn_weights用于`baddbmm`
-        # attn_weights = torch.empty(
-        #     bsz * num_heads, q_seq_len, k_seq_len, dtype=torch.float32, device=query.device)
-        # 计算缩放因子。
-        scale_factor = 1.0
-        if self.scale_attn_weights:
-            scale_factor /= float(value.size(-1)) ** 0.5
-        # 如果需要，按层级缩放。
-        if self.scale_attn_by_inverse_layer_idx:
-            scale_factor /= float(self.layer_idx + 1)
-        # 关闭自动计算并重新排序（缩放K为1/根号(dk)）
-        # Upcast (turn off autocast) and reorder (Scale K by 1 / root(dk))
-        # with torch.amp.autocast(query.device.type, enabled=False):
-        # q k^T
-        q, k = query.reshape(-1, q_seq_len, dk), key.transpose(-1, -2).reshape(
-            -1, dk, k_seq_len
-        )
-        # 使用baddbmm进行批量矩阵乘法，计算Q·K^T
-        # attn_weights = torch.baddbmm(
-        #     attn_weights, q.float(), k.float(), beta=0, alpha=scale_factor)
-
-        attn_weights = torch.matmul(q, k)
-
-        attn_weights = attn_weights * scale_factor
-
-        # # 重塑回原始形状
-        attn_weights = attn_weights.reshape(
-            bsz, num_heads, q_seq_len, k_seq_len)
-        # 对于自注意力，应用因果掩码
-        if not self.is_cross_attention:
-            # if only "normal" attention layer implements causal mask
-            # 序列长度
-            query_length, key_length = query.size(-2), key.size(-2)
-            # 计算因果掩码
-            causal_mask = self.bias[
-                :, :, key_length - query_length: key_length, :key_length
-            ]
-            # 获取掩码值（负无穷大）
-            mask_value = torch.finfo(attn_weights.dtype).min
-            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            mask_value = torch.tensor(
-                mask_value, dtype=attn_weights.dtype, device=attn_weights.device
-            )
-            # 应用掩码
-            attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-        # 应用额外的注意力掩码（如果提供）
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
-        # 应用softmax得到注意力权重
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op if otherwise
-        if attn_weights.dtype != torch.float32:
-            raise RuntimeError(
-                "Error with upcasting, attn_weights does not have dtype torch.float32"
-            )
-
-        # 转换数据类型
-        attn_weights = attn_weights.type(value.dtype)
-        # 应用dropout
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # Mask heads if we want to
-        # 应用头部掩码（如果提供）
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
-
-        # 计算注意力输出
-        # attn_weights: [bsz,num_heads,q_seq_len,k_seq_len]
-        # value: [bsz,num_heads,k_seq_len,head_dim]
-        # attn_output: [bsz,num_heads,q_seq_len,head_dim]
-        attn_output = torch.matmul(attn_weights, value)
-        attn_output = attn_output.transpose(1, 2)
-        # attn_output: [bsz,q_seq_len,num_heads,head_dim]
-
-        return attn_output, attn_weights
-
-
     # 原来的注意力计算方式，但是指定到确定的计算方式中
     def _ori_attn(
         self,
@@ -847,21 +674,49 @@ class GPT2AttentionOri(nn.Module):
                 self.c_attn.bias.data = self.c_attn.bias.data.to(torch.bfloat16)
                 
         if encoder_hidden_states is not None:
+
             if not hasattr(self, "q_attn"):
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
                     "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
                 )
+            # threshold = torch.quantile(encoder_hidden_states.abs().flatten(), 0.71)
+            # encoder_hidden_states = torch.where(
+            #     encoder_hidden_states.abs() < threshold,
+            #     torch.zeros_like(encoder_hidden_states),
+            #     encoder_hidden_states
+            # )   
             query_states = self.q_attn(hidden_states)
             key_states, value_states = self.c_attn(encoder_hidden_states).split(
                 self.split_size, dim=2
             )
+            # c_attn.weight的形状是[embed_dim, 2*embed_dim]
+            w_k, w_v = self.c_attn.weight.split(self.split_size, dim=1)
+            # c_attn.bias的形状是[2*embed_dim,]
+            k_bias, v_bias = self.c_attn.bias.split(self.split_size, dim=0)
+
             attention_mask = encoder_attention_mask
         else:
-            query_states, key_states, value_states = self.c_attn(hidden_states).split(
+            encoder_hidden_states = hidden_states
+            # threshold = torch.quantile(encoder_hidden_states.abs().flatten(), 0.71)
+            # encoder_hidden_states = torch.where(
+            #     encoder_hidden_states.abs() < threshold,
+            #     torch.zeros_like(encoder_hidden_states),
+            #     encoder_hidden_states
+            # )   
+            query_states, _, _ = self.c_attn(hidden_states).split(
+                self.split_size, dim=2
+            )
+            _, key_states, value_states = self.c_attn(encoder_hidden_states).split(
                 self.split_size, dim=2
             )
 
+            # c_attn.weight的形状是[embed_dim, 3*embed_dim]
+            w_q, w_k, w_v = self.c_attn.weight.split(self.split_size, dim=1)
+            # c_attn.bias的形状是[3*embed_dim,]
+            q_bias, k_bias, v_bias = self.c_attn.bias.split(
+                self.split_size, dim=0)
+            
         # query_states:[bsz,q_seq_len,hid_dim]
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
@@ -904,6 +759,7 @@ class GPT2AttentionOri(nn.Module):
             # 序列长度
             query_length, key_length = query_states.size(
                 -2), key_states.size(-2)
+            # print(f"query_length: {query_length}, key_length: {key_length}")
             # 计算因果掩码
             causal_mask = self.bias[
                 :, :, key_length - query_length: key_length, :key_length
@@ -921,6 +777,21 @@ class GPT2AttentionOri(nn.Module):
         if attention_mask is not None:
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
+
+        # # 在评估时保存第4层的完整注意力矩阵（在softmax之前）
+        # if self.layer_idx == 3 and not self.training:  # 只在评估时保存
+        #     if not hasattr(self, 'saved_scores'):
+        #         self.saved_scores = False
+            
+        #     # 只在最后一个token时保存一次完整的注意力矩阵
+        #     if not self.saved_scores and q_seq_len == k_seq_len:
+        #         scores_np = attn_weights.detach().cpu().numpy()
+        #         # 保存为npy格式
+        #         save_path = 'scores_layer4_before_softmax.npy'
+        #         np.save(save_path, scores_np)
+        #         print(f"已保存第4层注意力矩阵到: {save_path}")
+        #         self.saved_scores = True  # 标记已经保存过
+
         # 应用softmax得到注意力权重
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -938,13 +809,37 @@ class GPT2AttentionOri(nn.Module):
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
+        # attn_weights: [bsz,num_heads,q_seq_len,k_seq_len]
+        # encoder_hidden_states: [bsz,k_seq_len,embed_dim]
+        # 将encoder_hidden_states转换为多头形式
+        encoder_hidden_states = encoder_hidden_states.unsqueeze(1).expand(-1, num_heads, -1, -1)
+        # encoder_hidden_states: [bsz,num_heads,k_seq_len,embed_dim]
+        Scoresx = torch.matmul(attn_weights, encoder_hidden_states)
+        # Scoresx: [bsz,num_heads,q_seq_len,embed_dim]
+        
+        # w_v: [embed_dim,embed_dim]
+        Wv_heads = w_v.view(self.embed_dim, self.num_heads, self.head_dim)
+        # Wv_heads: [embed_dim,num_heads,head_dim]
+
+        # v_bias: [embed_dim,]
+        v_bias_heads = v_bias.reshape(1, 1, self.num_heads, self.head_dim).expand(bsz, k_seq_len, -1, -1).transpose(1, 2)
+        # v_bias_heads: [bsz,num_heads,q_seq_len,head_dim]
+
+        # attn_output: [bsz,num_heads,q_seq_len,embed_dim]
+        attn_output = torch.einsum('bnsd,dnt->bnst', Scoresx, Wv_heads) + v_bias_heads
+
+        attn_output = attn_output.transpose(1, 2)
+        # attn_output: [bsz,q_seq_len,num_heads,embed_dim]
+
+
+
         # 计算注意力输出
         # attn_weights: [bsz,num_heads,q_seq_len,k_seq_len]
         # value: [bsz,num_heads,k_seq_len,head_dim]
         # attn_output: [bsz,num_heads,q_seq_len,head_dim]
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2)
-        # attn_output: [bsz,q_seq_len,num_heads,head_dim]
+        # attn_output = torch.matmul(attn_weights, value_states)
+        # attn_output = attn_output.transpose(1, 2)
+        # # attn_output: [bsz,q_seq_len,num_heads,head_dim]
         
         # 如果使用了bf16，将输出转回原始精度
         if use_bf16 and torch.cuda.is_available():
@@ -983,8 +878,29 @@ class GPT2AttentionOri(nn.Module):
         # attn_output:[bsz,q_seq_len,hid_dim]
         # 应用残差连接和dropout
         attn_output = self.resid_dropout(attn_output)
-        # present 缓存的K、V
-        present = None
+        
+        # 处理 present 值
+        if use_cache:
+            # 计算当前的 key 和 value 状态
+            if encoder_hidden_states is not None:
+                key_states, value_states = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
+            else:
+                _, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            
+            # 重塑为多头形式
+            key_states = key_states.view(*key_states.shape[:-1], -1, self.head_dim).transpose(1, 2)
+            value_states = value_states.view(*value_states.shape[:-1], -1, self.head_dim).transpose(1, 2)
+            
+            # 如果有过去的缓存，将其与当前的K、V拼接
+            if layer_past is not None:
+                past_key, past_value = layer_past
+                key_states = torch.cat((past_key, key_states), dim=-2)
+                value_states = torch.cat((past_value, value_states), dim=-2)
+            
+            present = (key_states, value_states)
+        else:
+            present = None
+            
         outputs = (attn_output, present)
         if output_attentions:
             outputs += (attn_weights,)
