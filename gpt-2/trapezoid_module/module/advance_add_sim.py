@@ -156,7 +156,7 @@ class AdvanceAddUnit:
             #"pipeline_state": self.get_pipeline_state(),
         }
 
-    def reset(self):
+    def reset(self, M=-1, N=-1, c_values=[]):
         """重置流水线状态"""
         self.cycle_count = 0
 
@@ -178,6 +178,13 @@ class AdvanceAddUnit:
 
         # 重置加法单元
         self.add = AddUnit()
+
+        if M == -1 and N == -1 and len(c_values)==0:
+            pass
+        else:
+            self.M = M
+            self.N = N
+            self.c_values = c_values
 
     def get_pipeline_state(self):
         """获取流水线的当前状态"""

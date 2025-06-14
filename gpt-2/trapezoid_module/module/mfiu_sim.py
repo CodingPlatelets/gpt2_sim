@@ -236,10 +236,16 @@ class MFIUPipeline:
             return True
         return False
 
-    def reset(self):
+    def reset(self, width=-1, bit_width=-1):
         """重置流水线状态"""
         # 重置时钟计数器
         self.cycle_count = 0
+
+        if width ==-1 and bit_width==-1:
+            pass
+        else:
+            self.width = width
+            self.bit_width = width
 
         # 重置输出
         self.output = [[], []]
@@ -288,8 +294,8 @@ class MFIUPipeline:
         self.stage5_valid = False
 
         # 重置所有ShiftUnitPipeline
-        self.shift_unit_pipeline_batch_process_a.reset()
-        self.shift_unit_pipeline_batch_process_b.reset()
+        self.shift_unit_pipeline_batch_process_a.reset(self.bit_width)
+        self.shift_unit_pipeline_batch_process_b.reset(self.bit_width)
 
     def get_pipeline_state(self):
         """返回流水线当前状态"""

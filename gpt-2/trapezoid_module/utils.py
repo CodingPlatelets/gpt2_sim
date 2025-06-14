@@ -10,6 +10,18 @@ def bf16_add(bf16_a, bf16_b):
     sim.run_simulation([(bf16_a, bf16_b, True)], print_states=False)
     return sim.outputs[0]
 
+def bf16_add_list(bf16_a_list, bf16_b_list):
+    sim = BF16AddPipeline()
+    result = []
+    inputs = []
+    for a, b in zip(bf16_a_list, bf16_b_list):
+        inputs.append((a, b, True))
+    sim.run_simulation(inputs, False)
+    assert len(bf16_a_list) == len(bf16_b_list)
+    for i in range(len(bf16_a_list)):
+        result.append(sim.outputs[i])
+    return result
+
 
 def naive_matmul(A, B):
     """使用朴素方法计算矩阵乘法，用于结果验证"""

@@ -52,6 +52,7 @@ class BF16MultiplyPipeline:
 
     def decompose_bf16(self, bf16):
         """分解BF16为符号位、指数位和尾数位"""
+        bf16 = int(bf16)
         sign = (bf16 >> 15) & 0x1
         exponent = (bf16 >> 7) & 0xFF
         mantissa = bf16 & 0x7F

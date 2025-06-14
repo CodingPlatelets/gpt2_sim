@@ -3,7 +3,7 @@ from scipy.sparse import csr_matrix
 from tqdm import tqdm
 from collections import deque
 
-from .utils import FP32toBF16Pipeline, convert_through_pipeline, bf16_add, get_values_offset_mask, bf16_to_float, get_values_offset_mask_direct
+from .utils import FP32toBF16Pipeline, convert_through_pipeline, bf16_add, bf16_add_list, get_values_offset_mask, bf16_to_float, get_values_offset_mask_direct
 from .module.mfiu_sim import MFIUPipeline 
 from .module.add_tree_sim import AddTree
 from .module.compute_sim import MultiplyUnit
@@ -59,6 +59,7 @@ class TrapezoidPipeline:
         self.stage5_valid = False
 
         self.cycle_count = 0
+
 
     def init_c_values(self):
         c_values = [0] * self.M * self.N
@@ -273,10 +274,21 @@ class TrapezoidPipeline:
                 return True
         return False
 
-    def reset(self):
-        """重置TrapezoidPipeline的所有状态"""
+    def reset(self, M=-1, K=-1, N=-1):
+        """重置TrapezoidPipeline的所有状态并根据需要更新"""
         # 重置周期计数
         self.cycle_count = 0
+
+        # 设置M, K, N
+        if M == -1 and K == -1 and N == -1:
+            pass
+        else:
+            self.M = M
+            self.N = N
+            self.K = K
+
+        self.width = M * N
+        self.bit_width = K
 
         # 重置C矩阵值
         self.c_values = [0] * self.M * self.N
@@ -291,7 +303,8 @@ class TrapezoidPipeline:
             mac.valid = False
             mac.input_valid = False
 
-        self.add_tree.reset()
+        self.add_tree.reset(M, N, self.c_values)
+        self.mfiu.reset(self.width, self.bit_width)
 
         # 重置为deque
         self.values_A_queue = deque()
@@ -670,7 +683,7 @@ class TrapezoidPipeline:
         with tqdm(total=estimated_cycles, desc="HBM流水线处理", unit="cycle") as pbar:
             # 运行流水线，直到处理完所有输入并且没有更多有效数据
             cycle = 0
-            while (input_idx < len(B_data_list) or self.is_active()) and cycle < max_cycles:
+            while (input_idx < len(B_data_list) or self.is_active()) and (cycle < max_cycles or max_cycles == -1):
                 # 获取当前周期的输入，如果有的话
                 if input_idx < len(B_data_list):
                     # 总是获取A矩阵
@@ -844,7 +857,7 @@ class TrapezoidPipeline:
         with tqdm(total=estimated_cycles, desc="多Trapezoid HBM处理", unit="cycle") as pbar:
             # 运行流水线，直到处理完所有输入并且没有更多有效数据
             cycle = 0
-            while (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)) and cycle < max_cycles:
+            while (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)) and (cycle < max_cycles or max_cycles == -1):
                 
                 # 为每个trapezoid准备当前周期的输入
                 cycle_results = []
@@ -930,12 +943,15 @@ class TrapezoidPipeline:
         # 收集所有trapezoid的最终结果
         final_results = {}
         combined_c_matrix = None
-        
+        combined_c_matrix_bf16 = None
+
         for i, trapezoid in enumerate(trapezoid_list):
             # 转换结果矩阵为浮点数
             c_matrix = np.array([bf16_to_float(v) for v in trapezoid.c_values]).reshape(
                 trapezoid.M, trapezoid.N
             )
+
+
             final_results[f"trapezoid_{i}"] = {
                 "c_matrix": c_matrix,
                 "c_values_bf16": trapezoid.c_values.copy(),
@@ -948,6 +964,15 @@ class TrapezoidPipeline:
             else:
                 combined_c_matrix += c_matrix
 
+            if combined_c_matrix_bf16 is None:
+                combined_c_matrix_bf16 = trapezoid.c_values.copy()
+            else:
+                combined_c_matrix_bf16 = bf16_add_list(combined_c_matrix_bf16, trapezoid.c_values)
+        combined_c_matrix_bf16 = np.array(combined_c_matrix_bf16).reshape(trapezoid_list[0].M, trapezoid_list[0].N)
+
+        #combined_c_matrix_bf16_test = np.array([bf16_to_float(v) for v in combined_c_matrix_bf16]).reshape(trapezoid_list[0].M, trapezoid_list[0].N)
+        #print(combined_c_matrix_bf16_test)
+
         print(f"✅ 多Trapezoid HBM处理完成，总共 {cycle} 个周期")
 
         return {
@@ -955,6 +980,7 @@ class TrapezoidPipeline:
             "cycles": cycle,
             "individual_results": final_results,
             "combined_c_matrix": combined_c_matrix,
+            "combined_c_matrix_bf16": combined_c_matrix_bf16,
             "num_trapezoids": num_trapezoids
         }
 

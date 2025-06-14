@@ -90,7 +90,7 @@ class AddTree:
             "output": list(self.stage_output_vec[-1]) if self.stage_valid_vec[-1] else None,
         }
 
-    def reset(self):
+    def reset(self, M=-1, N=-1, c_values=[]):
         """重置加法树的所有状态"""
         self.cycle_count = 0
 
@@ -104,7 +104,7 @@ class AddTree:
         # 重置树中每个AdvanceAddUnit的状态
         for level in self.tree:
             for adder in level:
-                adder.reset()
+                adder.reset(M, N, c_values)
 
     def get_pipeline_state(self):
         """获取加法树的当前状态"""

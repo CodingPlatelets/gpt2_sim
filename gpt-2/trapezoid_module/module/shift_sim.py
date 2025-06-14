@@ -37,10 +37,14 @@ class ShiftUnitPipeline:
         self.output = []
         self.cycle_count = 0
 
-    def reset(self):
+    def reset(self, bit_width=-1):
         """重置流水线状态"""
         # 重置所有阶段状态
         # stage1 获取输入
+
+        if bit_width != -1:
+            self.min_bits_num = min_bits_needed(bit_width)
+
         self.stage1_valid = False
         self.stage1_bit_masks = []
         self.stage1_ec_idxs = []

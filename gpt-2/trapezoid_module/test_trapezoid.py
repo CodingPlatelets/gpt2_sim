@@ -53,8 +53,8 @@ def test_hbm_matrices():
 
     # 随机生成稀疏矩阵
 
-    A = np.random.choice([0, 1], size=(M, K), p=[0, 1])
-    B = np.random.choice([0, 1], size=(K, N), p=[0, 1])
+    A = np.random.choice([0, 1], size=(M, K), p=[0, 1]) * 0.1
+    B = np.random.choice([0, 1], size=(K, N), p=[0.9, 0.1]) * 0.1
     print(B)
     #M, K, N = 1, 4, 3
     expected_C = naive_matmul(A, B)
@@ -64,7 +64,7 @@ def test_hbm_matrices():
     #print(hbm_data_lists)
     print("\n运行流水线...")
     start_time = time.time()
-    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists, max_cycles=1000000, print_states=False)
+    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists, max_cycles=-1, print_states=False)
     end_time = time.time()
 
     # 打印结果
@@ -341,6 +341,6 @@ def test_multiple_matrices():
 
 #test_sparse_matrices()
 # test_multiple_matrices()
-test_hbm_matrices()
+#test_hbm_matrices()
 #test_hbm_small_matrices()
-#test_hbm_multi_matrices()
+test_hbm_multi_matrices()
