@@ -2,7 +2,7 @@ import numpy as np
 import time
 from .trapezoid_sim import TrapezoidPipeline
 from .utils import naive_matmul
-from hbm.csr_hbm_values_base import store_csr_in_simple_blocks
+from hbm.csr_hbm_values_base import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
 from scipy.sparse import csr_matrix
 
 
@@ -54,17 +54,17 @@ def test_hbm_matrices():
     # 随机生成稀疏矩阵
 
     A = np.random.choice([0, 1], size=(M, K), p=[0, 1])
-    B = np.random.choice([0, 1], size=(K, N), p=[0.9, 0.1])
+    B = np.random.choice([0, 1], size=(K, N), p=[0, 1])
     print(B)
     #M, K, N = 1, 4, 3
     expected_C = naive_matmul(A, B)
     pipeline = TrapezoidPipeline(M=M, K=K, N=N, PE_num=128)
 
-    hbm_data_lists = store_csr_in_simple_blocks(csr_matrix(B.T), 256)
+    hbm_data_lists = store_csr_in_simple_blocks_fast(csr_matrix(B.T), 256)
     #print(hbm_data_lists)
     print("\n运行流水线...")
     start_time = time.time()
-    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists, max_cycles=100000, print_states=False)
+    result = pipeline.run_pipeline_hbm_with_bf16([A], hbm_data_lists, max_cycles=1000000, print_states=False)
     end_time = time.time()
 
     # 打印结果
