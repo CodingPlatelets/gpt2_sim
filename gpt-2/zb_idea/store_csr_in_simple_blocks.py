@@ -103,6 +103,54 @@ def store_csr_in_simple_blocks(csr_matrix, elements_per_block=2):
 
     return blocks
 
+def store_csr_in_simple_blocks_fast(csr_matrix, elements_per_block=2):
+    values = csr_matrix.data
+    col_indices = csr_matrix.indices
+    row_pointers = csr_matrix.indptr
+    num_rows = csr_matrix.shape[0]
+    total_values = len(values)
+
+    # 预先生成每个元素的行号
+    row_indices = np.zeros_like(values, dtype=np.int32)
+    for row in range(num_rows):
+        row_indices[row_pointers[row]:row_pointers[row+1]] = row
+
+    num_blocks = (total_values + elements_per_block - 1) // elements_per_block
+    blocks = []
+
+    for block_idx in range(num_blocks):
+        start_idx = block_idx * elements_per_block
+        end_idx = min(start_idx + elements_per_block, total_values)
+
+        block_values = values[start_idx:end_idx].tolist()
+        block_col_indices = col_indices[start_idx:end_idx].tolist()
+        block_row_indices = row_indices[start_idx:end_idx]
+
+        if len(block_row_indices) == 0:
+            continue
+
+        row_start = block_row_indices[0]
+        row_end = block_row_indices[-1]
+        num_block_rows = row_end - row_start + 1
+
+        # 生成块内row_ptr
+        block_row_ptr = [0]
+        cur = 0
+        for r in range(row_start, row_end + 1):
+            # 统计本行在block中的元素数
+            count = np.sum(block_row_indices == r)
+            cur += count
+            block_row_ptr.append(cur)
+
+        block = {
+            "values": block_values,
+            "col_indices": block_col_indices,
+            "row_ptr": block_row_ptr,
+            "row_start_index": int(row_start),
+        }
+        blocks.append(block)
+    return blocks
+
 
 def test_csr_simple_blocks( matrix, elements_per_block=2, print_blocks=3, print_elements=20, debug=False):
     """
