@@ -127,7 +127,7 @@ def test_hbm_small_matrices():
         print(expected_C - result["c_matrix"])
 
 
-def test_hbm_multi_small_matrices():
+def test_hbm_multi_matrices():
     # 创建稀疏矩阵
     np.random.seed(42)
     M, K, N = 1, 4096, 4096
@@ -140,7 +140,7 @@ def test_hbm_multi_small_matrices():
     #M, K, N = 1, 4, 3
     expected_C = naive_matmul(A, B)
 
-    num_trapezoids = 128
+    num_trapezoids = 32
     trapezoid_list = []
 
     for i in range(num_trapezoids):
@@ -341,6 +341,6 @@ def test_multiple_matrices():
 
 #test_sparse_matrices()
 # test_multiple_matrices()
-#test_hbm_matrices()
+test_hbm_matrices()
 #test_hbm_small_matrices()
-test_hbm_multi_small_matrices()
+#test_hbm_multi_matrices()
