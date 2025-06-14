@@ -301,9 +301,8 @@ def test_bf16_pipeline_matmul(m=4, k=7, n=5, random_seed=123):
     """
     torch.manual_seed(random_seed)
     # 生成小数矩阵，范围在 -10 到 10
-    A = (torch.randn((m, k)) * 0.1).to(torch.bfloat16)
-    B = (torch.randn((k, n)) * 0.1).to(torch.bfloat16)
-
+    A = (torch.rand((m, k))).to(torch.bfloat16)
+    B = (torch.rand((k, n))).to(torch.bfloat16)
 
     # PyTorch 计算 bfloat16 结果
     C_torch = torch.matmul(A, B).to(torch.float32).numpy()
@@ -341,7 +340,7 @@ def test_bf16_pytorch_matmul_gpu(m=4, k=7, n=5, random_seed=123):
     
 if __name__ == '__main__':
     #verify_result(m=4, k=10, n=5, random_seed=42)
-    test_bf16_pipeline_matmul(m=4, k=100, n=5)
-    # test_bf16_pytorch_matmul_gpu()
+    test_bf16_pipeline_matmul(m=4, k=7, n=5)
+    test_bf16_pytorch_matmul_gpu()
                 
         
