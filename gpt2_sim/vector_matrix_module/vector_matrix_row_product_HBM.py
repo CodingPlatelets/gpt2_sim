@@ -8,8 +8,8 @@ import os
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
-from store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
-from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
+from vector_matrix_module.store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
+from vector_matrix_module.bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -242,7 +242,7 @@ class VectorMatrixRowProductSimulatorWithHBM:
         total_tasks_generated = 0
         cycle = 0
         num_blocks = len(B_blocks)
-        pbar = tqdm(total=num_blocks+100, desc="HBM周期注入", unit="cycle")
+        pbar = tqdm(total=num_blocks+100, desc="开始处理HBM数据", unit="cycle")
         
         while block_idx < num_blocks or any(perow.is_busy() for perow in self.perows):
             # 只有A_vector有效时才注入block
@@ -287,6 +287,11 @@ class VectorMatrixRowProductSimulatorWithHBM:
             for col_idx in range(self.vector_size):
                 self.final_result_vector[col_idx] += bf16_to_float(perow_result[col_idx])
         logger.info(f"模拟完成. 总周期: {cycle}, 总任务数: {total_tasks_generated}")
+        
+        return {
+            "output_vector": self.final_result_vector,
+            "clock": cycle,
+        }
 
     def verify_result(self, A_vector, B_matrix_sparse):
         """验证计算结果"""
@@ -305,11 +310,13 @@ class VectorMatrixRowProductSimulatorWithHBM:
             logger.error(f"预期结果样本:\n{reference_result[:10]}")
         return is_correct
 
-def main():
+
+
+if __name__ == "__main__":
     """主测试函数, 测试新的HBM模拟器"""
     # --- 配置 ---
     vec_dim = 4096
-    sparsity = 0
+    sparsity = 0.9
     elements_per_block = 256
     num_perows = 32
     pes_per_row = 128
@@ -323,10 +330,11 @@ def main():
     
     # --- 数据生成 ---
     logger.info("生成测试数据...")
-    A_vector = np.random.randn(vec_dim).astype(np.float32) * 0.1
+    vec_row = 1024
+    A_vector = np.random.randn(vec_row).astype(np.float32) * 0.1
     
-    B_dense = torch.randn((vec_dim, vec_dim)) * 0.01
-    mask = torch.rand(vec_dim, vec_dim) > sparsity
+    B_dense = torch.randn((vec_row, vec_dim)) * 0.01
+    mask = torch.rand(vec_row, vec_dim) > sparsity
     B_sparse = np.where(mask, B_dense.numpy(), 0).astype(np.float32)
     
     # --- 模拟 ---
@@ -340,7 +348,3 @@ def main():
     # --- 验证 ---
     simulator.verify_result(A_vector, B_sparse)
     logger.info("="*50)
-
-
-if __name__ == "__main__":
-    main()

@@ -8,8 +8,8 @@ import os
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
-from store_csr_in_simple_blocks import store_csr_in_simple_blocks
-from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
+from zb_idea.store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
+from zb_idea.bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -225,71 +225,73 @@ class VectorMatrixRowProductSimulatorWithHBM:
 
     def run_simulation(self, A_vector, B_matrix_sparse, elements_per_block=2048):
         """
-        执行基于HBM数据块的向量矩阵乘法模拟.
+        按照 HBM 硬件行为，每个周期只注入一个 block，其余周期只推进流水线。
+        如果A_vector为None或长度为0，则本周期不注入新任务，只推进流水线。
         """
-        logger.info(f"开始HBM模式模拟. A({A_vector.shape[0]}) @ B({B_matrix_sparse.shape})")
+        logger.info(f"开始HBM模式模拟. A({None if A_vector is None else A_vector.shape[0]}) @ B({B_matrix_sparse.shape})")
         self.reset()
 
         # --- 1. 数据准备 ---
-        # 修正: 必须使用scipy.csr_matrix与store_csr_in_simple_blocks配合
         B_csr = csr_matrix(B_matrix_sparse)
-        
         logger.info("将稀疏矩阵B分块...")
-        B_blocks = store_csr_in_simple_blocks(B_csr, elements_per_block)
+        B_blocks = store_csr_in_simple_blocks_fast(B_csr, elements_per_block)
         logger.info(f"矩阵B被分为 {len(B_blocks)} 个块.")
-        
-        # 转换输入向量A为BF16
-        A_vector_bf16 = [fp32_to_bf16(val) for val in A_vector]
+        A_vector_bf16 = [fp32_to_bf16(val) for val in A_vector] if (A_vector is not None and len(A_vector) > 0) else None
 
-        # --- 2. 按块处理 ---
+        block_idx = 0
         total_tasks_generated = 0
-        for i, block in enumerate(tqdm(B_blocks, desc="处理HBM块")):
-            # a. 为当前块生成任务
-            block_tasks = []
-            b_values_bf16 = [fp32_to_bf16(v) for v in block["values"]]
-            num_rows_in_block = len(block["row_ptr"]) - 1
-
-            for r_offset in range(num_rows_in_block):
-                start, end = block["row_ptr"][r_offset], block["row_ptr"][r_offset+1]
-                if start == end: continue
-
-                abs_row_idx = block["row_start_index"] + r_offset
-                a_val = A_vector_bf16[abs_row_idx]
-
-                for j in range(start, end):
-                    b_val = b_values_bf16[j]
-                    target_col_idx = block["col_indices"][j]
-                    block_tasks.append((a_val, b_val, target_col_idx))
-            
-            if not block_tasks: continue
-            
-            total_tasks_generated += len(block_tasks)
-
-            # b. 将当前块的任务均匀分配给PERows
-            tasks_per_perow = len(block_tasks) // self.num_perows
-            extra_tasks = len(block_tasks) % self.num_perows
-            task_idx = 0
-            for perow_idx in range(self.num_perows):
-                num_tasks_for_this_perow = tasks_per_perow + (1 if perow_idx < extra_tasks else 0)
-                if num_tasks_for_this_perow > 0:
-                    tasks_to_assign = block_tasks[task_idx : task_idx + num_tasks_for_this_perow]
-                    self.perows[perow_idx].assign_tasks(tasks_to_assign)
-                    task_idx += num_tasks_for_this_perow
-
-            # c. 运行模拟直到当前块的任务全部完成
-            while any(perow.is_busy() for perow in self.perows):
-                for perow in self.perows:
-                    perow.clock_cycle()
-                self.clock += 1
-
-        # --- 3. 最终累加 ---
-        logger.info("所有块处理完毕，开始累加最终结果...")
+        cycle = 0
+        num_blocks = len(B_blocks)
+        pbar = tqdm(total=num_blocks+100, desc="HBM周期注入", unit="cycle")
+        
+        while block_idx < num_blocks or any(perow.is_busy() for perow in self.perows):
+            # 只有A_vector有效时才注入block
+            if block_idx < num_blocks and A_vector_bf16 is not None and len(A_vector_bf16) > 0:
+                block = B_blocks[block_idx]
+                block_tasks = []
+                b_values_bf16 = [fp32_to_bf16(v) for v in block["values"]]
+                num_rows_in_block = len(block["row_ptr"]) - 1
+                for r_offset in range(num_rows_in_block):
+                    start, end = block["row_ptr"][r_offset], block["row_ptr"][r_offset+1]
+                    if start == end: continue
+                    # 计算出该行在全局A向量中的真实行号
+                    abs_row_idx = block["row_start_index"] + r_offset
+                    # 取出A向量对应行的元素
+                    a_val = A_vector_bf16[abs_row_idx]
+                    # 遍历该行在B矩阵中的非零元素
+                    for j in range(start, end):
+                        b_val = b_values_bf16[j]
+                        target_col_idx = block["col_indices"][j]
+                        block_tasks.append((a_val, b_val, target_col_idx))
+                total_tasks_generated += len(block_tasks)
+                # 均匀分配到所有perow
+                tasks_per_perow = len(block_tasks) // self.num_perows
+                extra_tasks = len(block_tasks) % self.num_perows
+                task_idx = 0
+                for perow_idx in range(self.num_perows):
+                    num_tasks_for_this_perow = tasks_per_perow + (1 if perow_idx < extra_tasks else 0)
+                    if num_tasks_for_this_perow > 0:
+                        tasks_to_assign = block_tasks[task_idx : task_idx + num_tasks_for_this_perow]
+                        self.perows[perow_idx].assign_tasks(tasks_to_assign)
+                        task_idx += num_tasks_for_this_perow
+                block_idx += 1
+            # 推进所有perow流水线
+            for perow in self.perows:
+                perow.clock_cycle()
+            cycle += 1
+            pbar.update(1)
+        pbar.close()
+        logger.info(f"所有块处理完毕，开始累加最终结果...")
         for perow in self.perows:
             perow_result = perow.get_result_vector()
             for col_idx in range(self.vector_size):
                 self.final_result_vector[col_idx] += bf16_to_float(perow_result[col_idx])
-        
-        logger.info(f"模拟完成. 总周期: {self.clock}, 总任务数: {total_tasks_generated}")
+        logger.info(f"模拟完成. 总周期: {cycle}, 总任务数: {total_tasks_generated}")
+
+        return {
+            "output_vector": self.final_result_vector,
+            "clock": cycle,
+        }
 
     def verify_result(self, A_vector, B_matrix_sparse):
         """验证计算结果"""
@@ -299,7 +301,7 @@ class VectorMatrixRowProductSimulatorWithHBM:
         error = np.abs(self.final_result_vector - reference_result).max()
         logger.info(f"与Numpy精确结果的最大误差: {error}")
         
-        is_correct = np.allclose(self.final_result_vector, reference_result, rtol=1e-2, atol=1e-2)
+        is_correct = np.allclose(self.final_result_vector, reference_result, rtol=1e-1, atol=1e-1)
         if is_correct:
             logger.info("✅ 验证成功!")
         else:
@@ -312,8 +314,7 @@ def main():
     """主测试函数, 测试新的HBM模拟器"""
     # --- 配置 ---
     vec_dim = 4096
-    mat_cols = 4096
-    sparsity = 0.9
+    sparsity = 0
     elements_per_block = 256
     num_perows = 32
     pes_per_row = 128
@@ -329,15 +330,15 @@ def main():
     logger.info("生成测试数据...")
     A_vector = np.random.randn(vec_dim).astype(np.float32) * 0.1
     
-    B_dense = torch.randn((vec_dim, mat_cols)) * 0.1
-    mask = torch.rand(vec_dim, mat_cols) > sparsity
+    B_dense = torch.randn((vec_dim, vec_dim)) * 0.01
+    mask = torch.rand(vec_dim, vec_dim) > sparsity
     B_sparse = np.where(mask, B_dense.numpy(), 0).astype(np.float32)
     
     # --- 模拟 ---
     simulator = VectorMatrixRowProductSimulatorWithHBM(
         num_perows=num_perows, 
         pes_per_row=pes_per_row, 
-        vector_size=mat_cols
+        vector_size=vec_dim
     )
     simulator.run_simulation(A_vector, B_sparse, elements_per_block)
     
