@@ -1,7 +1,7 @@
 import numpy as np
 import math
 import struct
-from bf16_module import BF16AddPipeline, FP32toBF16Pipeline
+from ..bf16_module import BF16AddPipeline, FP32toBF16Pipeline
 from collections import Counter
 from scipy.sparse import csr_matrix
 

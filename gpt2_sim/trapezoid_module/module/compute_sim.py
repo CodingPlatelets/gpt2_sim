@@ -1,5 +1,5 @@
-from bf16_module import BF16AddPipeline, BF16MultiplyPipeline
-from bf16_module.utils import convert_through_pipeline
+from ...bf16_module import BF16AddPipeline, BF16MultiplyPipeline
+from ...bf16_module.utils import convert_through_pipeline
 from collections import deque
 
 class MultiplyUnit:

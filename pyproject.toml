@@ -1,0 +1,27 @@
+[project]
+name = "gpt2-sim"
+version = "0.1.0"
+description = "GPT-2 Hardware Simulator with Trapezoid Pipeline"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.15.3",
+    "torch>=2.0.0",
+    "tqdm>=4.65.0",
+    "matplotlib>=3.5.0",
+]
+
+[project.scripts]
+test-trapezoid = "test_trapezoid_uv:main"
+
+[tool.uv]
+dev-dependencies = [
+    "jupyter>=1.0.0",
+    "ipython>=8.0.0",
+    "pytest>=7.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,5 +1,5 @@
 from ..module import MacUnit
-from bf16_module.utils import convert_through_pipeline
+from ...bf16_module.utils import convert_through_pipeline
 import struct
 def bf16_to_float(bf16):
     """将BF16转换为浮点数"""

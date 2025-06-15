@@ -1,9 +1,22 @@
+#!/usr/bin/env python3
+"""
+MFIU快速测试
+可以用 uv run gpt2_sim/trapezoid_module/test/test_mfiu_quick.py 运行
+"""
+
+import sys
+from pathlib import Path
+
+# 添加项目根目录到Python路径
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 import numpy as np
 import time
 from scipy.sparse import csr_matrix
-from ..module.mfiu_sim import MFIUPipeline
-from ..module.mfiu_sim_dense import MFIUPipelineDenseA
-from ..utils import get_values_offset_mask
+from gpt2_sim.trapezoid_module.module.mfiu_sim import MFIUPipeline
+from gpt2_sim.trapezoid_module.module.mfiu_sim_dense import MFIUPipelineDenseA
+from gpt2_sim.trapezoid_module.utils import get_values_offset_mask
 
 def quick_performance_test():
     """快速性能测试"""
