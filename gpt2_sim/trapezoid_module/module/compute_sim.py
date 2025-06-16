@@ -1,5 +1,5 @@
-from bf16_module import BF16AddPipeline, BF16MultiplyPipeline
-from bf16_module.utils import convert_through_pipeline
+from gpt2_sim.bf16_module import BF16AddPipeline, BF16MultiplyPipeline
+from gpt2_sim.bf16_module.utils import convert_through_pipeline
 from collections import deque
 
 class MultiplyUnit:

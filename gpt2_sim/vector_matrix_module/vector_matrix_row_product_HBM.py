@@ -8,8 +8,8 @@ import os
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
-from vector_matrix_module.store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
-from vector_matrix_module.bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
+from gpt2_sim.vector_matrix_module.store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
+from gpt2_sim.vector_matrix_module.bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
