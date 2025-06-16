@@ -108,8 +108,3 @@ def get_values_offset_mask_direct(values_input, col_indices_input, row_ptr_input
 
 
 
-def test():
-    x = convert_through_pipeline(288)
-    y = bf16_to_float(x)
-
-test()

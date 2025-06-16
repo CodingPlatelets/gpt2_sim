@@ -8,8 +8,8 @@ import os
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
-from vector_matrix_module.store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
-from vector_matrix_module.bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
+from .store_csr_in_simple_blocks import  store_csr_in_simple_blocks_fast
+from .bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,7 +17,7 @@ logger = logging.getLogger("VecMatProdSim")
 
 def direct_bf16_add(a, b):
     """直接计算两个BF16数字的和"""
-    from bf16_sim import BF16AddPipeline as BF16AddPipelineClass
+    from .bf16_sim import BF16AddPipeline as BF16AddPipelineClass
     pipeline = BF16AddPipelineClass()
     pipeline.run_simulation([(a, b, True)], print_states=False)
     return pipeline.outputs[0] if pipeline.outputs else 0
