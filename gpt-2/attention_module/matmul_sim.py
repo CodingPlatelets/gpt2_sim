@@ -42,7 +42,11 @@ class Matmul:
         for trape in self.trapezoid_rows:
             trape.reset(M, K, N)
         main_trap = self.trapezoid_rows[0]
-        result = main_trap.run_pipeline_hbm_multi([A], self.hbm_data, self.trapezoid_rows, -1)
+        is_batch = len(A.shape) == 3
+        if is_batch:
+            result = main_trap.run_pipeline_hbm_multi_batch_for_weight_fast(A, self.hbm_data, self.trapezoid_rows, -1)
+        else:
+            result = main_trap.run_pipeline_hbm_multi([A], self.hbm_data, self.trapezoid_rows, -1)
         if test:
             return result["combined_c_matrix"]
         return result["combined_c_matrix_bf16"]
