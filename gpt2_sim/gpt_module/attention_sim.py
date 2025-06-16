@@ -1,8 +1,8 @@
 from .matmul_sim import Matmul
-from gpt2_sim.vector_matrix_module.softmax import Softmax
+from vector_matrix_module.softmax import Softmax
 from .test import generate_x_wq_wk_xt, generate_matrix
-from gpt2_sim.vector_matrix_module.row_product_module import RowProduct
-from gpt2_sim.bf16_module.utils import convert_through_pipeline
+from vector_matrix_module.row_product_module import RowProduct
+from bf16_module.utils import convert_through_pipeline
 import numpy as np
 
 class Attention:

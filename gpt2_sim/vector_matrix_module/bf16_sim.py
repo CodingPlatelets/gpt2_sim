@@ -1,5 +1,8 @@
 import struct
 import random
+import numpy as np
+import math
+
 class FP32toBF16Pipeline:
     def __init__(self):
         """初始化流水线寄存器和状态"""
@@ -929,6 +932,314 @@ class BF16MultiplyPipeline:
             or self.stage5_valid
         )
 
+class BF16DividePipeline:
+    def __init__(self):
+        """初始化流水线寄存器和状态"""
+        # 阶段1: 获取输入并处理特殊情况
+        self.stage1_valid = False
+        self.stage1_bf16_a = 0
+        self.stage1_bf16_b = 0
+        self.stage1_special_case = False
+        self.stage1_result = 0
+
+        # 阶段2: 分解提取和指数处理阶段
+        self.stage2_valid = False
+        self.stage2_special_case = False
+        self.stage2_result = 0
+        self.stage2_sign_result = 0
+        self.stage2_exp_a = 0
+        self.stage2_exp_b = 0
+        self.stage2_mant_a = 0
+        self.stage2_mant_b = 0
+
+        # 阶段3: 尾数除法阶段
+        self.stage3_valid = False
+        self.stage3_special_case = False
+        self.stage3_result = 0
+        self.stage3_sign_result = 0
+        self.stage3_exp_result = 0
+        self.stage3_mant_result = 0
+
+        # 阶段4: 规范化和舍入阶段
+        self.stage4_valid = False
+        self.stage4_special_case = False
+        self.stage4_result = 0
+        self.stage4_sign_result = 0
+        self.stage4_exp_result = 0
+        self.stage4_mant_result = 0
+
+        self.stage5_valid = False
+
+        # 常量定义
+        self.POS_INF = 0x7F80  # 正无穷大：0 11111111 0000000
+        self.NEG_INF = 0xFF80  # 负无穷大：1 11111111 0000000
+        self.NAN = 0x7FC0      # NaN：0 11111111 1000000
+
+        # 输出缓冲区
+        self.outputs = []
+        self.cycle_count = 0
+
+    def reset(self):
+        """重置流水线状态"""
+        self.__init__()
+
+    def decompose_bf16(self, bf16):
+        """分解BF16为符号位、指数位和尾数位"""
+        sign = (bf16 >> 15) & 0x1
+        exponent = (bf16 >> 7) & 0xFF
+        mantissa = bf16 & 0x7F
+        return sign, exponent, mantissa
+
+    def compose_bf16(self, sign, exponent, mantissa):
+        """组合符号位、指数位和尾数位为BF16"""
+        return (sign << 15) | (exponent << 7) | (mantissa & 0x7F)
+
+    def check_special_cases(self, bf16_a, bf16_b):
+        """检查并处理特殊情况"""
+        sign_a, exp_a, mant_a = self.decompose_bf16(bf16_a)
+        sign_b, exp_b, mant_b = self.decompose_bf16(bf16_b)
+
+        # 符号位：相除后的符号位是两个符号位的异或
+        sign_result = sign_a ^ sign_b
+
+        # 1. 处理 NaN
+        if ((exp_a == 0xFF and mant_a != 0) or (exp_b == 0xFF and mant_b != 0)):
+            return True, self.NAN
+
+        # 2. 处理 0/0 = NaN
+        if ((exp_a == 0 and mant_a == 0) and (exp_b == 0 and mant_b == 0)):
+            return True, self.NAN
+
+        # 3. 处理 x/0 = Inf (x != 0)
+        if (exp_b == 0 and mant_b == 0) and (exp_a != 0 or mant_a != 0):
+            return True, self.compose_bf16(sign_result, 0xFF, 0)
+
+        # 4. 处理 Inf/Inf = NaN
+        if ((exp_a == 0xFF and exp_b == 0xFF)):
+            return True, self.NAN
+
+        # 5. 处理 Inf/x = Inf (x != Inf)
+        if (exp_a == 0xFF) and (exp_b != 0xFF):
+            return True, self.compose_bf16(sign_result, 0xFF, 0)
+
+        # 6. 处理 x/Inf = 0 (x != Inf)
+        if (exp_b == 0xFF) and (exp_a != 0xFF):
+            return True, self.compose_bf16(sign_result, 0, 0)
+
+        # 不是特殊情况
+        return False, 0
+
+    def clock_cycle(self, bf16_a=None, bf16_b=None, valid=False):
+        """模拟一个时钟周期，推进流水线"""
+        self.cycle_count += 1
+
+        # 阶段5: 输出阶段
+        self.stage5_valid = self.stage4_valid
+        if self.stage4_valid:
+            result_bf16 = 0
+            if self.stage4_special_case:
+                result_bf16 = self.stage4_result
+            else:
+                sign_result = self.stage4_sign_result
+                exp_result = self.stage4_exp_result
+                mant_result = self.stage4_mant_result
+
+                # 处理结果为0的情况
+                if mant_result == 0:
+                    result_bf16 = self.compose_bf16(sign_result, 0, 0)
+                else:
+                    # 规范化处理
+                    while mant_result and not (mant_result & 0x80):
+                        mant_result <<= 1
+                        exp_result -= 1
+
+                    # 去掉隐含的最高位
+                    mant_result &= 0x7F
+
+                    # 处理下溢和上溢
+                    if exp_result <= 0:
+                        if exp_result < -6:  # 太小，返回零
+                            result_bf16 = self.compose_bf16(sign_result, 0, 0)
+                        else:  # 非规格化数
+                            denorm_mant = 0x80 | mant_result
+                            shift_amount = 1 - exp_result
+                            round_bit = (denorm_mant >> (shift_amount - 1)) & 1
+                            sticky_bits = (denorm_mant & ((1 << (shift_amount - 1)) - 1)) != 0
+                            denorm_mant >>= shift_amount
+                            if round_bit and (sticky_bits or (denorm_mant & 1)):
+                                denorm_mant += 1
+                            result_bf16 = self.compose_bf16(sign_result, 0, denorm_mant & 0x7F)
+                    elif exp_result >= 0xFF:
+                        result_bf16 = self.compose_bf16(sign_result, 0xFF, 0)
+                    else:
+                        result_bf16 = self.compose_bf16(sign_result, exp_result, mant_result)
+
+            self.outputs.append(result_bf16)
+
+        # 阶段4: 规范化和舍入
+        self.stage4_valid = self.stage3_valid
+        self.stage4_special_case = self.stage3_special_case
+        self.stage4_result = self.stage3_result
+        self.stage4_sign_result = self.stage3_sign_result
+        self.stage4_exp_result = self.stage3_exp_result
+        self.stage4_mant_result = self.stage3_mant_result
+
+        # 阶段3: 尾数除法
+        self.stage3_valid = self.stage2_valid
+        self.stage3_special_case = self.stage2_special_case
+        self.stage3_result = self.stage2_result
+        self.stage3_sign_result = self.stage2_sign_result
+
+        if self.stage2_valid and not self.stage2_special_case:
+            # 指数相减（在除法中，指数是相减的），并加上偏移值（127）
+            self.stage3_exp_result = self.stage2_exp_a - self.stage2_exp_b + 127
+
+            # 尾数除法（带隐含的最高位）
+            if self.stage2_mant_b != 0:
+                self.stage3_mant_result = (self.stage2_mant_a << 7) // self.stage2_mant_b
+            else:
+                self.stage3_mant_result = 0
+
+        # 阶段2: 分解和准备
+        self.stage2_valid = self.stage1_valid
+        self.stage2_special_case = self.stage1_special_case
+        self.stage2_result = self.stage1_result
+
+        if self.stage1_valid and not self.stage1_special_case:
+            sign_a, exp_a, mant_a = self.decompose_bf16(self.stage1_bf16_a)
+            sign_b, exp_b, mant_b = self.decompose_bf16(self.stage1_bf16_b)
+
+            # 计算结果符号位
+            self.stage2_sign_result = sign_a ^ sign_b
+
+            # 处理非规格化数
+            if exp_a == 0:
+                if mant_a != 0:
+                    leading_bit = 0
+                    temp_mant = mant_a
+                    while temp_mant and not (temp_mant & 0x80):
+                        temp_mant <<= 1
+                        leading_bit += 1
+                    exp_a = 1 - leading_bit
+                    mant_a <<= leading_bit
+                else:
+                    exp_a = 1
+            else:
+                mant_a |= 0x80
+
+            if exp_b == 0:
+                if mant_b != 0:
+                    leading_bit = 0
+                    temp_mant = mant_b
+                    while temp_mant and not (temp_mant & 0x80):
+                        temp_mant <<= 1
+                        leading_bit += 1
+                    exp_b = 1 - leading_bit
+                    mant_b <<= leading_bit
+                else:
+                    exp_b = 1
+            else:
+                mant_b |= 0x80
+
+            self.stage2_exp_a = exp_a
+            self.stage2_exp_b = exp_b
+            self.stage2_mant_a = mant_a
+            self.stage2_mant_b = mant_b
+
+        # 阶段1: 获取输入
+        if valid and bf16_a is not None and bf16_b is not None:
+            self.stage1_bf16_a = bf16_a
+            self.stage1_bf16_b = bf16_b
+            self.stage1_valid = True
+
+            is_special, result = self.check_special_cases(bf16_a, bf16_b)
+            self.stage1_special_case = is_special
+            self.stage1_result = result
+        else:
+            self.stage1_valid = False
+            self.stage1_bf16_a = 0
+            self.stage1_bf16_b = 0
+            self.stage1_special_case = False
+            self.stage1_result = 0
+
+        return {
+            "cycle": self.cycle_count,
+            "valid_output": self.stage5_valid,
+            "pipeline_state": self.get_pipeline_state()
+        }
+
+    def get_pipeline_state(self):
+        """返回流水线的当前状态"""
+        return {
+            "stage1": {
+                "valid": self.stage1_valid,
+                "bf16_a": hex(self.stage1_bf16_a) if self.stage1_valid else "invalid",
+                "bf16_b": hex(self.stage1_bf16_b) if self.stage1_valid else "invalid",
+                "special": self.stage1_special_case
+            },
+            "stage2": {
+                "valid": self.stage2_valid,
+                "special": self.stage2_special_case,
+                "sign_result": self.stage2_sign_result if self.stage2_valid else "invalid",
+                "exp_a": self.stage2_exp_a if self.stage2_valid else "invalid",
+                "exp_b": self.stage2_exp_b if self.stage2_valid else "invalid",
+                "mant_a": hex(self.stage2_mant_a) if self.stage2_valid else "invalid",
+                "mant_b": hex(self.stage2_mant_b) if self.stage2_valid else "invalid"
+            },
+            "stage3": {
+                "valid": self.stage3_valid,
+                "special": self.stage3_special_case,
+                "sign_result": self.stage3_sign_result if self.stage3_valid else "invalid",
+                "exp_result": self.stage3_exp_result if self.stage3_valid else "invalid",
+                "mant_result": hex(self.stage3_mant_result) if self.stage3_valid else "invalid"
+            },
+            "stage4": {
+                "valid": self.stage4_valid,
+                "special": self.stage4_special_case,
+                "sign_result": self.stage4_sign_result if self.stage4_valid else "invalid",
+                "exp_result": self.stage4_exp_result if self.stage4_valid else "invalid",
+                "mant_result": hex(self.stage4_mant_result) if self.stage4_valid else "invalid"
+            }
+        }
+
+    def is_active(self):
+        """检查流水线是否活跃"""
+        return (self.stage1_valid or self.stage2_valid or 
+                self.stage3_valid or self.stage4_valid or 
+                self.stage5_valid)
+
+    def run_simulation(self, inputs, print_states=True):
+        """运行流水线模拟"""
+        self.reset()
+        results = []
+
+        extended_inputs = list(inputs) + [(0, 0, False)] * 4
+
+        for i in range(len(extended_inputs)):
+            bf16_a, bf16_b, valid = extended_inputs[i]
+            result = self.clock_cycle(bf16_a, bf16_b, valid)
+            results.append(result)
+
+            if print_states:
+                self.print_pipeline_state()
+
+        return results
+
+    def print_pipeline_state(self):
+        """打印当前流水线状态"""
+        state = self.get_pipeline_state()
+        print(f"Cycle {self.cycle_count}:")
+        print(f"  Stage 1: {'Valid' if state['stage1']['valid'] else 'Invalid'} - "
+              f"BF16 A: {state['stage1']['bf16_a']}, BF16 B: {state['stage1']['bf16_b']} "
+              f"{'(Special case)' if state['stage1']['special'] else ''}")
+        print(f"  Stage 2: {'Valid' if state['stage2']['valid'] else 'Invalid'} - "
+              f"{'Special case' if state['stage2']['special'] else 'Prepared operands'}")
+        print(f"  Stage 3: {'Valid' if state['stage3']['valid'] else 'Invalid'} - "
+              f"{'Special case' if state['stage3']['special'] else 'Division result'}")
+        print(f"  Stage 4: {'Valid' if state['stage4']['valid'] else 'Invalid'} - "
+              f"{'Special case' if state['stage4']['special'] else 'Normalized result'}")
+        print()
+
 def convert_through_pipeline(value):
         """通过完整流水线模拟转换FP32到BF16"""
         temp_pipeline = FP32toBF16Pipeline()
@@ -1370,11 +1681,881 @@ def test_bf16multiply():
                     print(f"  Sign check: Result should be +0.0")
                     print(f"  Correct sign: {not np.signbit(custom_result)}")
 
+class BF16SqrtPipeline2:
+    def __init__(self):
+        """初始化流水线寄存器和状态"""
+        # 流水线寄存器
+        self.stage1_bf16_a = 0
+        self.stage1_valid = False
+        self.stage1_special_case = False
+        self.stage1_result = 0
+        
+        self.stage2_valid = False
+        self.stage2_special_case = False
+        self.stage2_result = 0
+        self.stage2_sign = 0
+        self.stage2_exp = 0
+        self.stage2_mant = 0
+        
+        self.stage3_valid = False
+        self.stage3_special_case = False
+        self.stage3_result = 0
+        self.stage3_sign = 0
+        self.stage3_exp = 0
+        self.stage3_mant = 0
+
+        self.stage4_valid = False
+        
+        # 输出缓冲区
+        self.outputs = []
+        self.cycle_count = 0
+        
+        # 特殊值常量
+        self.POSITIVE_INFINITY = 0x7F80
+        self.NEGATIVE_INFINITY = 0xFF80
+        self.NAN = 0x7FC0
+    
+    def reset(self):
+        """重置流水线状态"""
+        self.__init__()
+    
+    def decompose_bf16(self, bf16):
+        """将BF16值分解为符号、指数和尾数"""
+        sign = (bf16 >> 15) & 0x1
+        exponent = (bf16 >> 7) & 0xFF
+        mantissa = bf16 & 0x7F
+        return sign, exponent, mantissa
+    
+    def compose_bf16(self, sign, exponent, mantissa):
+        """将符号、指数和尾数组合为BF16值"""
+        return (sign << 15) | (exponent << 7) | mantissa
+    
+    def check_special_cases(self, bf16_a):
+        """检查特殊情况"""
+        if bf16_a == self.NAN:
+            return True, self.NAN
+        if bf16_a == self.POSITIVE_INFINITY:
+            return True, self.POSITIVE_INFINITY
+        if bf16_a == self.NEGATIVE_INFINITY:
+            return True, self.NAN
+        if bf16_a == 0:
+            return True, 0
+        
+        sign, exp, mant = self.decompose_bf16(bf16_a)
+        if sign == 1:  # 负数
+            return True, self.NAN
+        
+        # 检查非规格化数
+        if exp == 0 and mant == 0:
+            return True, 0
+        
+        return False, 0
+    
+    def clock_cycle2(self, bf16_a=None, valid=False):
+        """执行一个时钟周期"""
+        # 阶段4: 输出阶段
+        self.stage4_valid = self.stage3_valid
+        if self.stage3_valid:
+            if not self.stage3_special_case:
+                # 组合最终结果
+                result = self.compose_bf16(
+                    self.stage3_sign,
+                    self.stage3_exp,
+                    self.stage3_mant
+                )
+                self.outputs.append(result)
+            else:
+                self.outputs.append(self.stage3_result)
+        
+        # 阶段3: 开平方计算阶段
+        self.stage3_valid = self.stage2_valid
+        self.stage3_special_case = self.stage2_special_case
+        self.stage3_result = self.stage2_result
+        
+        if self.stage2_valid and not self.stage2_special_case:
+            # 计算开平方
+            exp = self.stage2_exp
+            mant = self.stage2_mant
+            
+            # 处理非规格化数
+            if exp == 0:
+                # 非规格化数，没有隐含的1
+                if mant == 0:
+                    self.stage3_mant = 0
+                    self.stage3_exp = 0
+                    self.stage3_sign = 0
+                    return {"valid_output": self.stage4_valid}
+                
+                # 找到最高有效位
+                leading_zeros = 0
+                temp_mant = mant
+                while temp_mant and not (temp_mant & 0x80):
+                    temp_mant <<= 1
+                    leading_zeros += 1
+                
+                # 调整尾数和指数
+                mant = mant << leading_zeros
+                exp = 1 - leading_zeros
+            else:
+                # 规格化数，添加隐含的1
+                mant = (mant | 0x80) << 7  # 左移7位，因为BF16尾数是7位
+            
+            # 计算新的指数
+            unbiased_exp = exp - 127
+            if unbiased_exp & 1:
+                # 如果无偏指数是奇数，需要调整尾数
+                mant = mant << 1
+                unbiased_exp += 1
+            
+            # 计算新的指数
+            self.stage3_exp = (unbiased_exp >> 1) + 127
+            
+            # 使用牛顿迭代法计算平方根
+            # 将输入值转换为定点数表示
+            a = mant
+            
+            # 初始估计值：使用2^(exp/2)作为初始值
+            exp_shift = (self.stage3_exp - 127) >> 1
+            if exp_shift >= 0:
+                x = 1 << exp_shift
+            else:
+                x = 1
+            
+            # 牛顿迭代
+            for _ in range(4):  # 4次迭代
+                # 计算 a/x
+                if x == 0:
+                    break
+                a_div_x = a // x
+                # 计算 (x + a/x)/2
+                x = (x + a_div_x) >> 1
+                # 如果x变为0，说明输入太小，需要调整
+                if x == 0:
+                    x = 1
+            
+            # 规范化结果
+            if x == 0:
+                self.stage3_mant = 0
+                self.stage3_exp = 0
+            else:
+                # 规范化到[0x80, 0x100)范围
+                while x >= 0x100 and self.stage3_exp < 254:
+                    x >>= 1
+                    self.stage3_exp += 1
+                while x < 0x80 and self.stage3_exp > 0:
+                    x <<= 1
+                    self.stage3_exp -= 1
+                
+                # 提取尾数（去掉隐含的1）
+                self.stage3_mant = x & 0x7F
+            
+            self.stage3_sign = 0  # 平方根总是正数
+        
+        # 阶段2: 分解阶段
+        self.stage2_valid = self.stage1_valid
+        self.stage2_special_case = self.stage1_special_case
+        self.stage2_result = self.stage1_result
+        
+        if self.stage1_valid and not self.stage1_special_case:
+            self.stage2_sign, self.stage2_exp, self.stage2_mant = self.decompose_bf16(self.stage1_bf16_a)
+        
+        # 阶段1: 输入阶段        
+        if valid and bf16_a is not None:
+            self.stage1_bf16_a = bf16_a
+            self.stage1_valid = True
+            #检查特殊情况
+            self.stage1_special_case, self.stage1_result = self.check_special_cases(bf16_a)
+        else:
+            self.stage1_valid = False
+            self.stage1_bf16_a = 0
+            self.stage1_special_case = False
+            self.stage1_result = 0
+        
+        self.cycle_count += 1
+        return {"valid_output": self.stage4_valid}
+    
+    def clock_cycle(self, bf16_a=None, valid=False):
+        """执行一个时钟周期（牛顿迭代修复版）"""
+        # 阶段4: 输出阶段
+        self.stage4_valid = self.stage3_valid
+        if self.stage3_valid:
+            if not self.stage3_special_case:
+                result = self.compose_bf16(
+                    self.stage3_sign,
+                    self.stage3_exp,
+                    self.stage3_mant
+                )
+                self.outputs.append(result)
+            else:
+                self.outputs.append(self.stage3_result)
+        
+        # 阶段3: 开平方计算阶段
+        self.stage3_valid = self.stage2_valid
+        self.stage3_special_case = self.stage2_special_case
+        self.stage3_result = self.stage2_result
+        
+        if self.stage2_valid and not self.stage2_special_case:
+            # 准备被开方数
+            exp = self.stage2_exp
+            mant = self.stage2_mant
+            
+            # 非规格化数处理
+            if exp == 0 and mant != 0:
+                # 找到第一个1的位置
+                count = 0
+                while (mant & 0x80) == 0 and count < 7:
+                    mant <<= 1
+                    count += 1
+                exp = 1 - count  # 更新指数为规格化形式
+            else:
+                mant |= 0x80  # 添加隐含的1
+            
+            # 组成16位定点数（8位整数 + 8位小数）
+            a = mant << 8
+            
+            # 计算真实指数（无偏指数）
+            unbiased_exp = exp - 127
+            
+            # 调整指数是否为奇数
+            if unbiased_exp & 1:
+                a <<= 1  # 左移尾数补偿奇数指数
+                unbiased_exp += 1
+            
+            # 牛顿迭代法核心实现
+            # --------------------------
+            # 1. 准备32位精度的定点数
+            a_fixed = a << 16  # 24.8定点数 → 24.24定点数
+            
+            # 2. 更好的初始估计值（基于位数）
+            if a_fixed > 0:
+                # 近似：初始值 = 2^(bit_length/2)
+                n = a_fixed.bit_length()
+                x = 1 << ((n + 1) // 2)
+            else:
+                x = 1
+            
+            # 3. 牛顿迭代（6次确保7位精度）
+            prev_x = 0
+            for i in range(6):  # 6次迭代
+                if x == 0:
+                    x = 1
+                # 高精度计算：保留小数部分
+                x_squared = x * x
+                if x_squared == a_fixed:
+                    break
+                # x_{n+1} = (x_n + a/x_n) // 2
+                x_next = (x + (a_fixed // x)) // 2
+                # 收敛检查
+                if x_next == x or x_next == prev_x:
+                    break
+                prev_x = x
+                x = x_next
+            
+            # 4. 提取结果（取高8位整数）
+            # 右移24位：24.24定点数 → 0.24定点数 → 24位整数
+            sqrt_val = (x + 128) >> 8  # 四舍五入到最接近的整数
+            # --------------------------
+            
+            # 规范化结果
+            self.stage3_exp = (unbiased_exp // 2) + 127  # 初始指数估计
+            temp_mant = sqrt_val
+            
+            # 调整尾数到[128, 256)区间
+            while temp_mant >= 0x100 and self.stage3_exp < 0xFE:
+                temp_mant >>= 1
+                self.stage3_exp += 1
+            
+            while temp_mant < 0x80 and self.stage3_exp > 1:
+                temp_mant <<= 1
+                self.stage3_exp -= 1
+            
+            # 处理指数边界
+            if self.stage3_exp > 0xFE:  # 上溢
+                self.stage3_exp = 0xFF
+                self.stage3_mant = 0
+            elif self.stage3_exp < 1:  # 下溢
+                self.stage3_exp = 0
+                self.stage3_mant = 0
+            else:
+                self.stage3_mant = temp_mant & 0x7F  # 取低7位
+            
+            self.stage3_sign = 0  # 平方根总是正数
+        
+        # 阶段2: 分解阶段
+        self.stage2_valid = self.stage1_valid
+        self.stage2_special_case = self.stage1_special_case
+        self.stage2_result = self.stage1_result
+        
+        if self.stage1_valid and not self.stage1_special_case:
+            self.stage2_sign, self.stage2_exp, self.stage2_mant = self.decompose_bf16(self.stage1_bf16_a)
+        
+        # 阶段1: 输入阶段        
+        if valid and bf16_a is not None:
+            self.stage1_bf16_a = bf16_a
+            self.stage1_valid = True
+            # 检查特殊情况
+            self.stage1_special_case, self.stage1_result = self.check_special_cases(bf16_a)
+        else:
+            self.stage1_valid = False
+            self.stage1_bf16_a = 0
+            self.stage1_special_case = False
+            self.stage1_result = 0
+        
+        self.cycle_count += 1
+        return {"valid_output": self.stage4_valid}
+    def get_pipeline_state(self):
+        """获取当前流水线状态"""
+        return {
+            "stage1": {
+                "valid": self.stage1_valid,
+                "bf16_a": self.stage1_bf16_a,
+                "special": self.stage1_special_case
+            },
+            "stage2": {
+                "valid": self.stage2_valid,
+                "special": self.stage2_special_case,
+                "sign": self.stage2_sign,
+                "exp": self.stage2_exp,
+                "mant": self.stage2_mant
+            },
+            "stage3": {
+                "valid": self.stage3_valid,
+                "special": self.stage3_special_case,
+                "sign": self.stage3_sign,
+                "exp": self.stage3_exp,
+                "mant": self.stage3_mant
+            },
+        }
+    
+    def is_active(self):
+        """检查流水线是否活跃"""
+        return (self.stage1_valid 
+                or self.stage2_valid
+                or self.stage3_valid
+                or self.stage4_valid)
+    
+    def run_simulation(self, inputs, print_states=True):
+        """运行流水线模拟"""
+        self.reset()
+        results =[]
+        # 确保输入列表足够长，不足部分用(0, False)填充
+        extended_inputs = list(inputs) + [(0, False)] * 4  # 加4个周期确保流水线清空
+
+        for i in range(len(extended_inputs)):
+            bf16_a, valid = extended_inputs[i]
+            print(bf16_a)
+            result = self.clock_cycle(bf16_a, valid)
+            results.append(result)
+            if print_states:
+                self.print_pipeline_state()
+
+        return results
+    
+    def print_pipeline_state(self):
+        """打印当前流水线状态"""
+        state = self.get_pipeline_state()
+        print(f"Cycle {self.cycle_count}:")
+        print(f"  Stage 1: {'Valid' if state['stage1']['valid'] else 'Invalid'} - "
+              f"BF16 A: {state['stage1']['bf16_a']} "
+              f"{'(Special case)' if state['stage1']['special'] else ''}")
+        print(f"  Stage 2: {'Valid' if state['stage2']['valid'] else 'Invalid'} - "
+              f"{'Special case' if state['stage2']['special'] else 'Prepared operand'}")
+        print(f"  Stage 3: {'Valid' if state['stage3']['valid'] else 'Invalid'} - "
+              f"{'Special case' if state['stage3']['special'] else 'Square root result'}")
+        print()
+class BF16SqrtPipeline:
+    def __init__(self):
+        """初始化流水线寄存器和状态"""
+        # 流水线寄存器
+        self.stage1_bf16_a = 0
+        self.stage1_valid = False
+        self.stage1_special_case = False
+        self.stage1_result = 0
+        
+        self.stage2_valid = False
+        self.stage2_special_case = False
+        self.stage2_result = 0
+        self.stage2_sign = 0
+        self.stage2_exp = 0
+        self.stage2_mant = 0
+        
+        self.stage3_valid = False
+        self.stage3_special_case = False
+        self.stage3_result = 0
+        self.stage3_sign = 0
+        self.stage3_exp = 0
+        self.stage3_mant = 0
+        
+        self.stage4_valid = False
+        
+        # 输出缓冲区
+        self.outputs = []
+        self.cycle_count = 0
+        
+        # 特殊值常量
+        self.POSITIVE_INFINITY = 0x7F80
+        self.NEGATIVE_INFINITY = 0xFF80
+        self.NAN = 0x7FC0
+        
+        # 预计算的平方根表格（128个条目）
+        self.sqrt_table = self.generate_sqrt_table()
+    
+    def generate_sqrt_table(self):
+        """生成7位精度的平方根表"""
+        table = []
+        for i in range(128):
+            # 尾数范围 [0.0, 1.0) -> [1.0, 2.0)
+            mant_val = 1.0 + i / 128.0
+            sqrt_val = math.sqrt(mant_val)
+            
+            # 将结果转换回尾数表示
+            sqrt_mant = int(round((sqrt_val - 1.0) * 128))
+            table.append(min(127, max(0, sqrt_mant)))
+        return table
+    
+    def reset(self):
+        """重置流水线状态"""
+        self.__init__()
+    
+    def decompose_bf16(self, bf16):
+        """将BF16值分解为符号、指数和尾数"""
+        sign = (bf16 >> 15) & 0x1
+        exponent = (bf16 >> 7) & 0xFF
+        mantissa = bf16 & 0x7F
+        return sign, exponent, mantissa
+    
+    def compose_bf16(self, sign, exponent, mantissa):
+        """将符号、指数和尾数组合为BF16值"""
+        return (sign << 15) | (exponent << 7) | mantissa
+    
+    def check_special_cases(self, bf16_a):
+        """检查特殊情况"""
+        if bf16_a == self.NAN:
+            return True, self.NAN
+        if bf16_a == self.POSITIVE_INFINITY:
+            return True, self.POSITIVE_INFINITY
+        if bf16_a == self.NEGATIVE_INFINITY:
+            return True, self.NAN
+        if bf16_a == 0:
+            return True, 0
+        
+        sign, exp, mant = self.decompose_bf16(bf16_a)
+        if sign == 1:  # 负数
+            return True, self.NAN
+        
+        # 非规格化数（当作0处理）
+        if exp == 0 and mant != 0:
+            return True, 0
+        
+        return False, 0
+    
+    def clock_cycle(self, bf16_a=None, valid=False):
+        """执行一个时钟周期（使用优化的平方根算法）"""
+        # 阶段4: 输出阶段
+        self.stage4_valid = self.stage3_valid
+        if self.stage3_valid:
+            if not self.stage3_special_case:
+                result = self.compose_bf16(
+                    self.stage3_sign,
+                    self.stage3_exp,
+                    self.stage3_mant
+                )
+                self.outputs.append(result)
+            else:
+                self.outputs.append(self.stage3_result)
+        
+        # 阶段3: 开平方计算阶段
+        self.stage3_valid = self.stage2_valid
+        self.stage3_special_case = self.stage2_special_case
+        self.stage3_result = self.stage2_result
+        
+        if self.stage2_valid and not self.stage2_special_case:
+            # 提取指数和尾数
+            exp = self.stage2_exp
+            mant = self.stage2_mant
+            
+            # 1. 计算真实指数（减去偏移）
+            unbiased_exp = exp - 127
+            
+            # 2. 构建带隐含1的尾数（规格化数）
+            full_mant = 0x80 | mant  # [128, 255]
+            sqrt_input = full_mant
+            
+            # 3. 调整奇数指数
+            exp_odd = unbiased_exp & 1
+            if exp_odd:
+                # 指数为奇数时左移尾数
+                sqrt_input <<= 1
+                unbiased_exp += 1  # 指数调整为偶数
+            unbiased_exp >>= 1  # 指数除2
+            
+            # 4. 精确计算平方根
+            # 4.1 高位算法（基于整数平方根）
+            # 找到大于或等于输入的最小平方数
+            root_high = 0
+            cur_bit = 0x80  # 从最高位开始
+            
+            while cur_bit:
+                test_value = root_high | cur_bit
+                square = test_value * test_value
+                if square <= sqrt_input:
+                    root_high = test_value
+                cur_bit >>= 1
+            
+            # 4.2 使用预计算表格提升精度
+            residual = sqrt_input - root_high * root_high
+            table_index = min(127, max(0, (residual << 6) // root_high))
+            table_correction = self.sqrt_table[table_index]
+            
+            # 组合最终结果
+            root_fixed = (root_high << 7) + table_correction
+            
+            # 5. 规范化结果
+            # 提取整数部分（位16-23）
+            result_mant = (root_fixed >> 7) & 0xFF
+            
+            # 规范化处理
+            if result_mant >= 0x100:  # 需要右移
+                result_mant >>= 1
+                unbiased_exp += 1
+            elif result_mant < 0x80 and unbiased_exp > 0:  # 需要左移
+                result_mant <<= 1
+                unbiased_exp -= 1
+            
+            # 检查指数边界
+            if unbiased_exp <= -126:  # 下溢
+                stored_exp = 0
+                stored_mant = 0
+            elif unbiased_exp >= 126:  # 上溢（无穷大）
+                stored_exp = 0xFF
+                stored_mant = 0
+            else:  # 正常范围
+                stored_exp = unbiased_exp + 127
+                stored_mant = result_mant & 0x7F  # 取低7位
+            
+            self.stage3_exp = stored_exp
+            self.stage3_mant = stored_mant
+            self.stage3_sign = 0
+        
+        # 阶段2: 分解阶段
+        self.stage2_valid = self.stage1_valid
+        self.stage2_special_case = self.stage1_special_case
+        self.stage2_result = self.stage1_result
+        
+        if self.stage1_valid and not self.stage1_special_case:
+            self.stage2_sign, self.stage2_exp, self.stage2_mant = self.decompose_bf16(self.stage1_bf16_a)
+        
+        # 阶段1: 输入阶段        
+        if valid and bf16_a is not None:
+            self.stage1_bf16_a = bf16_a
+            self.stage1_valid = True
+            # 检查特殊情况
+            self.stage1_special_case, self.stage1_result = self.check_special_cases(bf16_a)
+        else:
+            self.stage1_valid = False
+            self.stage1_bf16_a = 0
+            self.stage1_special_case = False
+            self.stage1_result = 0
+        
+        self.cycle_count += 1
+        return {"valid_output": self.stage4_valid}
+    
+    def get_pipeline_state(self):
+        """获取当前流水线状态"""
+        return {
+            "stage1": {
+                "valid": self.stage1_valid,
+                "bf16_a": self.stage1_bf16_a,
+                "special": self.stage1_special_case
+            },
+            "stage2": {
+                "valid": self.stage2_valid,
+                "special": self.stage2_special_case,
+                "sign": self.stage2_sign,
+                "exp": self.stage2_exp,
+                "mant": self.stage2_mant
+            },
+            "stage3": {
+                "valid": self.stage3_valid,
+                "special": self.stage3_special_case,
+                "sign": self.stage3_sign,
+                "exp": self.stage3_exp,
+                "mant": self.stage3_mant
+            },
+        }
+    
+    def is_active(self):
+        """检查流水线是否活跃"""
+        return (self.stage1_valid or 
+                self.stage2_valid or
+                self.stage3_valid or
+                self.stage4_valid)
+    
+    def run_simulation(self, inputs, print_states=True):
+        """运行流水线模拟"""
+        self.reset()
+        # 扩展输入以确保流水线完全清空
+        extended_inputs = list(inputs) + [(0, False)] * 4
+        
+        for bf16_a, valid in extended_inputs:
+            if print_states:
+                self.print_pipeline_state()
+            self.clock_cycle(bf16_a, valid)
+        
+        if print_states:
+            self.print_pipeline_state()
+        return self.outputs
+    
+    def print_pipeline_state(self):
+        """打印当前流水线状态"""
+        state = self.get_pipeline_state()
+        print(f"Cycle {self.cycle_count}:")
+        print(f"  Stage 1: {'Valid' if state['stage1']['valid'] else 'Invalid'} - "
+              f"BF16 A: {hex(state['stage1']['bf16_a'])} "
+              f"{'(Special case)' if state['stage1']['special'] else ''}")
+        print(f"  Stage 2: {'Valid' if state['stage2']['valid'] else 'Invalid'} - "
+              f"{'Special case' if state['stage2']['special'] else 'Prepared operand'}")
+        print(f"  Stage 3: {'Valid' if state['stage3']['valid'] else 'Invalid'} - "
+              f"{'Special case' if state['stage3']['special'] else 'Square root result'}")
+        print()
+
+def test_bf16divide():
+    """测试BF16除法流水线"""
+    print("\n" + "="*60)
+    print("BF16除法流水线测试")
+    print("="*60)
+    
+    # 创建流水线实例
+    pipeline = BF16DividePipeline()
+    
+    def float_to_bf16(value):
+        """将float转换为BF16格式"""
+        if isinstance(value, np.ndarray):
+            value = float(value.item())
+        elif isinstance(value, (np.float32, np.float64)):
+            value = float(value)
+        
+        fp32_bits = struct.unpack('>I', struct.pack('>f', value))[0]
+        bf16_bits = (fp32_bits >> 16) & 0xFFFF
+        return bf16_bits
+    
+    def bf16_to_float(bf16):
+        """将BF16格式转换为float"""
+        fp32_bits = bf16 << 16
+        return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
+    
+    def test_cases_bf16_divide(test_cases):
+        """测试一系列除法用例"""
+        for a, b, expected in test_cases:
+            a_bf16 = float_to_bf16(a)
+            b_bf16 = float_to_bf16(b)
+            expected_bf16 = float_to_bf16(expected)
+            
+            # 运行流水线
+            pipeline.reset()
+            result = pipeline.run_simulation([(a_bf16, b_bf16, True)], print_states=False)
+            
+            # 获取结果
+            actual_bf16 = pipeline.outputs[0] if pipeline.outputs else 0
+            actual_float = bf16_to_float(actual_bf16)
+            expected_float = bf16_to_float(expected_bf16)
+            
+            # 计算误差
+            if expected_float != 0:
+                error = abs(actual_float - expected_float) / abs(expected_float)
+            else:
+                error = abs(actual_float - expected_float)
+            
+            # 打印结果
+            print(f"测试: {a} / {b} = {expected}")
+            print(f"  BF16结果: {actual_float:.6f}")
+            print(f"  预期结果: {expected_float:.6f}")
+            print(f"  相对误差: {error:.6f}")
+            
+            # 检查特殊情况
+            if np.isnan(expected_float):
+                assert np.isnan(actual_float), f"期望NaN，得到{actual_float}"
+            elif np.isinf(expected_float):
+                assert np.isinf(actual_float), f"期望Inf，得到{actual_float}"
+            else:
+                assert error < 0.1, f"误差过大: {error}"
+            print()
+    
+    # 基本测试用例
+    basic_cases = [
+        (1.0, 2.0, 0.5),
+        (4.0, 2.0, 2.0),
+        (10.0, 5.0, 2.0),
+        (0.1, 0.2, 0.5),
+        (1.0, 0.5, 2.0),
+    ]
+    
+    # 特殊情况测试用例
+    special_cases = [
+        (1.0, 0.0, float('inf')),  # 除以零
+        (0.0, 0.0, float('nan')),  # 零除以零
+        (float('inf'), float('inf'), float('nan')),  # 无穷除以无穷
+        (float('inf'), 1.0, float('inf')),  # 无穷除以有限数
+        (1.0, float('inf'), 0.0),  # 有限数除以无穷
+        (float('nan'), 1.0, float('nan')),  # NaN除以数
+        (1.0, float('nan'), float('nan')),  # 数除以NaN
+    ]
+    
+    print("基本除法测试:")
+    test_cases_bf16_divide(basic_cases)
+    
+    print("特殊情况测试:")
+    test_cases_bf16_divide(special_cases)
+
+def test_bf16sqrt():
+    """测试BF16开平方流水线"""
+    print("\n" + "="*60)
+    print("BF16开平方流水线测试")
+    print("="*60)
+    
+    # 创建流水线实例
+    pipeline = BF16SqrtPipeline()
+    
+    import torch
+    import numpy as np
+    
+    def float_to_bf16(value):
+        """将float转换为BF16格式"""
+        if isinstance(value, np.ndarray):
+            value = float(value.item())
+        elif isinstance(value, (np.float32, np.float64)):
+            value = float(value)
+        
+        fp32_bits = struct.unpack('>I', struct.pack('>f', value))[0]
+        bf16_bits = (fp32_bits >> 16) & 0xFFFF
+        return bf16_bits
+    
+    def bf16_to_float(bf16):
+        """将BF16格式转换为float"""
+        fp32_bits = bf16 << 16
+        return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]
+    
+    # 准备常规测试用例
+    regular_cases = [
+        (4.0, True),      # 简单开方: sqrt(4.0) = 2.0
+        (9.0, True),      # sqrt(9.0) = 3.0
+        (16.0, True),     # sqrt(16.0) = 4.0
+        (0.25, True),     # sqrt(0.25) = 0.5
+        (0.01, True),     # sqrt(0.01) = 0.1
+        (2.0, True),      # sqrt(2.0) ≈ 1.414
+        (3.0, True),      # sqrt(3.0) ≈ 1.732
+        (5.0, True),      # sqrt(5.0) ≈ 2.236
+    ]
+    
+    # 添加随机测试用例
+    for _ in range(10):
+        a = random.uniform(0, 100)  # 只生成正数
+        regular_cases.append((a, True))
+    
+    # 特殊情况测试用例
+    special_cases = [
+        (-1.0, True),     # 负数
+        (0.0, True),      # 零
+        (float('inf'), True),  # 无穷
+        (float('nan'), True),  # NaN
+    ]
+    
+    # 合并所有测试用例
+    test_cases = regular_cases + special_cases
+    
+    # 转换测试用例为BF16格式
+    bf16_test_cases = [(float_to_bf16(a), valid) for a, valid in test_cases]
+    
+    print("Starting BF16 Square Root Pipeline Simulation")
+    print("=" * 80)
+    
+    # 运行模拟
+    results = pipeline.run_simulation(bf16_test_cases, print_states=True)
+    
+    print("=" * 80)
+    print("Final Results:")
+    print("{:<5} {:<15} {:<15} {:<20} {:<15} {:<15}".format(
+        "Test", "Input", "Expected Result", "Custom BF16 Result", "PyTorch Result", "Error vs PyTorch"
+    ))
+    print("-" * 80)
+    
+    for i, output in enumerate(pipeline.outputs):
+        if i < len(test_cases) and test_cases[i][1]:  # 只检查有效输入
+            a, _ = test_cases[i]
+            
+            # 自定义实现的结果
+            custom_result = bf16_to_float(output)
+            
+            # 获取PyTorch的BF16计算结果
+            try:
+                torch_a = torch.tensor(a, dtype=torch.float32).bfloat16()
+                torch_result = torch.sqrt(torch_a).float().item()
+                
+                # 计算与PyTorch结果的差异
+                if np.isnan(custom_result) and np.isnan(torch_result):
+                    error = "N/A (Both NaN)"
+                elif np.isinf(custom_result) and np.isinf(torch_result) and np.sign(custom_result) == np.sign(torch_result):
+                    error = "N/A (Both Inf)"
+                else:
+                    # 对于非常小的结果，使用相对误差
+                    if abs(torch_result) > 1e-10:
+                        error = abs((custom_result - torch_result) / torch_result)
+                    else:
+                        error = abs(custom_result - torch_result)
+            except:
+                torch_result = "N/A"
+                error = "N/A"
+            
+            # 预期结果
+            expected = np.sqrt(a) if a >= 0 else float('nan')
+            
+            print("{:<5} {:<15} {:<15} {:<20} {:<15} {:<15}".format(
+                i,
+                f"{a:.6g}",
+                f"{expected:.6g}" if not np.isnan(expected) else "NaN",
+                f"{custom_result:.6g} ({hex(output)})" if not np.isnan(custom_result) else f"NaN ({hex(output)})",
+                f"{torch_result:.6g}" if torch_result != "N/A" else torch_result,
+                f"{error:.6g}" if error != "N/A (Both NaN)" and error != "N/A (Both Inf)" and error != "N/A" else error
+            ))
+    
+    print("\nDetailed Analysis of Special Cases:")
+    special_start = len(regular_cases)
+    special_end = len(test_cases)
+    
+    for i in range(special_start, special_end):
+        if i < len(pipeline.outputs):
+            a, _ = test_cases[i]
+            output = pipeline.outputs[i]
+            custom_result = bf16_to_float(output)
+            
+            print(f"\nTest {i}: sqrt({a})")
+            print(f"  BF16 Result: {hex(output)} -> {custom_result}")
+            
+            # 特殊情况的分析
+            if np.isnan(a):
+                print("  Analysis: Input is NaN, result should be NaN")
+                print(f"  Correct: {np.isnan(custom_result)}")
+            elif a < 0:
+                print("  Analysis: Negative input, result should be NaN")
+                print(f"  Correct: {np.isnan(custom_result)}")
+            elif np.isinf(a):
+                print("  Analysis: Infinity input, result should be Infinity")
+                print(f"  Correct: {np.isinf(custom_result)}")
+            elif a == 0.0:
+                print("  Analysis: Zero input, result should be zero")
+                print(f"  Correct: {custom_result == 0.0}")
+                print(f"  Sign check: Result should be +0.0")
+                print(f"  Correct sign: {not np.signbit(custom_result)}")
+
+
+
 
 # 测试模拟器
 if __name__ == "__main__":
     #test_fp32_to_bf16()
-    test_bf16add()
+    # test_bf16add()
+    # test_bf16divide()
+    test_bf16sqrt()
     #test_bf16multiply()
     #t = 0.0
     #return struct.unpack('>f', struct.pack('>I', fp32_bits))[0]

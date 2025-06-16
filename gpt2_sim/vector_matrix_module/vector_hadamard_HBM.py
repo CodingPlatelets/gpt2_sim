@@ -7,7 +7,7 @@ import sys
 import os
 from tqdm import tqdm
 
-from gpt2_sim.vector_matrix_module.bf16_sim import BF16MultiplyPipeline, FP32toBF16Pipeline
+from vector_matrix_module.bf16_sim import BF16MultiplyPipeline, FP32toBF16Pipeline
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

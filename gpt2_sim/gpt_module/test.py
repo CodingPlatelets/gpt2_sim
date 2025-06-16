@@ -1,8 +1,8 @@
 import numpy as np
 from scipy.sparse import csr_matrix
-from gpt2_sim.trapezoid_module.trapezoid_sim import TrapezoidPipeline
-from gpt2_sim.hbm import store_csr_in_simple_blocks_fast
-from gpt2_sim.bf16_module.utils import convert_through_pipeline
+from trapezoid_module.trapezoid_sim import TrapezoidPipeline
+from hbm import store_csr_in_simple_blocks_fast
+from bf16_module.utils import convert_through_pipeline
 from .matmul_sim import Matmul
 
 
