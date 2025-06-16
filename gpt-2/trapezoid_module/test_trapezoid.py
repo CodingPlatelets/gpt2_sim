@@ -126,6 +126,99 @@ def test_hbm_small_matrices():
         print("差异矩阵：")
         print(expected_C - result["c_matrix"])
 
+def test_hbm_multi_batch():
+
+    np.random.seed(42)
+    M, K, N = 1, 1024, 1024
+    num_trapezoids = 32
+    batch_size = 32
+
+    A_batch_matrices = []
+
+    for i in range(batch_size):
+        A = np.random.choice([0, 1], size=(M, K), p=[0, 1])
+        A_batch_matrices.append(A)
+    A_batch_matrices = np.array(A_batch_matrices).reshape(batch_size, M, K)
+
+    B_batch_matrices = []
+    for i in range(batch_size):
+        B = np.random.choice([0, 1], size=(K, N), p=[0.9, 0.1])
+        B_batch_matrices.append(B)
+    B_batch_matrices = np.array(B_batch_matrices).reshape(batch_size, K, N)
+
+    hbm_data_lists_batch = []
+
+    for bx in range(batch_size):
+        hbm_data_lists_batch.append(store_csr_in_simple_blocks_fast(csr_matrix(B_batch_matrices[bx].T), 256))
+    
+    bf16_A_batch_matrices = np.zeros_like(A_batch_matrices)
+    for i in range(bf16_A_batch_matrices.shape[0]):
+        for j in range(bf16_A_batch_matrices.shape[1]):
+            for k in range(bf16_A_batch_matrices.shape[2]):
+                if A_batch_matrices[i, j, k] != 0:
+                    bf16_A_batch_matrices[i, j, k] = convert_through_pipeline(float(A_batch_matrices[i, j, k]))
+    bf16_A_batch_matrices = np.array(bf16_A_batch_matrices).reshape(batch_size, M, K)
+
+    bf16_hbm_data_lists_batch = []
+
+    for bx, hbm_data_lists in enumerate(hbm_data_lists_batch):
+        bf16_hbm_data_lists = []
+        for data_idx, B_data in enumerate(hbm_data_lists):
+            # 转换B矩阵的values
+            values_B = B_data.get("values", [])
+            bf16_values_B = []
+            for val in values_B:
+                if val != 0:
+                    bf16_values_B.append(convert_through_pipeline(float(val)))
+                else:
+                    bf16_values_B.append(0)
+
+            # 创建新的B数据字典，保持col_indices和row_ptr不变
+            bf16_B_data = {
+                "values": bf16_values_B,
+                "col_indices": B_data.get("col_indices", []),
+                "row_ptr": B_data.get("row_ptr", []),
+                "row_start_index": B_data.get("row_start_index", 0)
+            }
+            bf16_hbm_data_lists.append(bf16_B_data)
+            
+            if data_idx % 100 == 0 or data_idx == len(hbm_data_lists) - 1:
+                print(f"  B数据块转换进度: {data_idx + 1}/{len(hbm_data_lists)}")
+        bf16_hbm_data_lists_batch.append(bf16_hbm_data_lists)
+        
+        print(f"✅ 第{bx}BF16转换完成！")
+        print(f"   A矩阵batch数: {bf16_A_batch_matrices.shape[0]}")
+        print(f"   B数据块数: {len(bf16_hbm_data_lists)}")
+
+    expected_c_matrix = np.matmul(A_batch_matrices, B_batch_matrices)
+
+    trapezoid_list = []
+    for i in range(num_trapezoids):
+        trap = TrapezoidPipeline(M, K, N, 128)
+        trapezoid_list.append(trap)
+    
+    main_trap = trapezoid_list[0]
+    print("运行批处理权重共享流水线（BF16模式）...")
+    result = main_trap.run_pipeline_hbm_multi_batch(
+        bf16_A_batch_matrices,  # 使用BF16格式的A矩阵
+        bf16_hbm_data_lists_batch,    # 使用BF16格式的B数据
+        trapezoid_list, 
+        max_cycles=-1, 
+        print_states=False
+    )
+
+    c_matrix = result["combined_c_matrix"]
+
+    is_correct = np.allclose(expected_c_matrix, c_matrix, rtol=5e-2, atol=5e-2)
+                
+    if is_correct:
+        print(f" ✓ 正确")
+    else:
+        print(f" ✗ 错误")
+    print(c_matrix)
+    print(expected_c_matrix)
+
+
 def test_hbm_multi_batch_for_weight():
     """测试批处理权重共享HBM多流水线处理"""
     print("\n===== 测试批处理权重共享HBM处理 =====")
@@ -624,6 +717,7 @@ def test_multiple_matrices():
 #test_hbm_matrices()
 #test_hbm_small_matrices()
 #test_hbm_multi_matrices()
-test_hbm_multi_batch_for_weight()
+#test_hbm_multi_batch_for_weight()
 #test_hbm_multi_batch_for_weight_edge_cases()
+test_hbm_multi_batch()
 

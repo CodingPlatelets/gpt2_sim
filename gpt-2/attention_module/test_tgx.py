@@ -182,8 +182,28 @@ def test_batch():
         print("diff: ")
         print(expected_xwq - xwq)
 
+def test_batch_no_shared():
+    matmul = Matmul(128, 32, 256)
+    x, wq, wk, xt = generate_x_wq_wk_xt_batch(100, 256, 0.9, 4)
 
-test_batch()
+    wq = np.broadcast_to(wq, (4, 256, 256)).copy()
+
+    #print(x.shape)
+    x_bf16 = convert_batch_matrix_to_bf16(x)
+
+    matmul.load_from_hbm_batch(wq)
+    expected_xwq = np.matmul(x, wq)
+    xwq = matmul.forward(x_bf16, x.shape[1], x.shape[2], wq.shape[1], True)
+
+    if np.allclose(expected_xwq, xwq, rtol=1e-2, atol=1e-2):
+        print("✓ True!")
+    else:
+        print("✗ False!")
+        print("diff: ")
+        print(expected_xwq - xwq)
+
+
+test_batch_no_shared()
 
     
 
