@@ -1329,6 +1329,11 @@ def bf16_mul(bf16_a, bf16_b):
     sim.run_simulation([(bf16_a, bf16_b, True)], False)
     return sim.outputs[0]
 
+def bf16_div(bf16_a, bf16_b):
+    sim = BF16DividePipeline()
+    sim.run_simulation([(bf16_a, bf16_b, True)], False)
+    return sim.outputs[0]
+
 def test_bf16add():
     # 创建流水线实例
     pipeline = BF16AddPipeline()
