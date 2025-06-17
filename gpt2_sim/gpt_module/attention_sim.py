@@ -87,4 +87,4 @@ def test():
         print("diff: ")
         print(expected_xwqkx - xwwxt)
 
-# test()
+test()
