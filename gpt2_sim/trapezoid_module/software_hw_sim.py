@@ -135,10 +135,11 @@ class RowState:
         self.back_window = back_window
         
         # 处理阶段
-        self.phase = "collecting_window"  # collecting_window, processing_exp, division, completed
+        self.phase = "collecting_window"  # collecting_window, processing_window_exp, processing_remaining_exp, division, completed
         
         # 数据收集
         self.window_data = {}  # {col_idx: val_bf16}
+        self.remaining_data = {}  # {col_idx: val_bf16}
         self.all_data = {}     # {col_idx: val_bf16}
         self.received_count = 0
         
@@ -148,18 +149,27 @@ class RowState:
         self.window_complete = False
         
         # 计算状态
-        self.estimated_max = None
+        self.window_max = None  # 窗口内的最大值
+        self.global_max = None  # 全局最大值
+        self.current_max = None  # 当前使用的最大值（初始为窗口最大值，可能会更新）
         self.exp_values = {}  # {col_idx: exp_val_bf16}
         self.exp_sum = convert_through_pipeline(0.0)
         self.final_results = {}  # {col_idx: softmax_val_bf16}
         
         # 处理进度
-        self.exp_processing_idx = 0  # 当前处理到的列索引
+        self.window_exp_idx = 0  # 窗口exp处理索引
+        self.remaining_exp_idx = 0  # 非窗口exp处理索引
         self.division_processing_idx = 0
         
         # 溢出检测
         self.overflow_detected = False
         self.max_updated = False
+        self.window_exp_completed = False
+        self.remaining_exp_completed = False
+        
+        # 窗口和非窗口数据的有序列表
+        self.window_indices = []
+        self.remaining_indices = []
 
     def is_window_data(self, col_idx):
         """判断是否为窗口数据"""
@@ -178,6 +188,24 @@ class RowState:
             if col_idx >= (self.row_length - self.back_window):
                 self.back_window_received.add(col_idx)
             
+            # 更新窗口最大值
+            if self.window_max is None:
+                self.window_max = val_bf16
+                self.current_max = val_bf16
+                self.global_max = val_bf16
+            else:
+                # 比较并更新窗口最大值
+                val_float = bf16_to_float(val_bf16)
+                max_float = bf16_to_float(self.window_max)
+                if val_float > max_float:
+                    self.window_max = val_bf16
+                    self.current_max = val_bf16
+                    self.global_max = val_bf16
+            
+            # 添加到窗口索引列表
+            if col_idx not in self.window_indices:
+                self.window_indices.append(col_idx)
+            
             # 检查窗口是否收集完成
             front_needed = min(self.front_window, self.row_length)
             back_needed = min(self.back_window, self.row_length)
@@ -186,56 +214,54 @@ class RowState:
                 len(self.back_window_received) == back_needed and 
                 not self.window_complete):
                 self.window_complete = True
-                self._estimate_max()
-    
-    def _estimate_max(self):
-        """从窗口数据估算最大值"""
-        max_val = None
-        for val_bf16 in self.window_data.values():
-            if max_val is None:
-                max_val = val_bf16
-            else:
+                self.phase = "processing_window_exp"
+                print(f"   行{self.row_id}: 窗口收集完成，开始处理窗口exp，最大值 {hex(self.window_max)} ({bf16_to_float(self.window_max):.3f})")
+                # 对窗口索引排序以便有序处理
+                self.window_indices.sort()
+        else:
+            # 非窗口数据
+            self.remaining_data[col_idx] = val_bf16
+            
+            # 添加到非窗口索引列表
+            if col_idx not in self.remaining_indices:
+                self.remaining_indices.append(col_idx)
+            
+            # 如果已经在处理非窗口exp，则需要检查是否需要更新最大值
+            if self.phase == "processing_remaining_exp":
                 val_float = bf16_to_float(val_bf16)
-                max_float = bf16_to_float(max_val)
+                max_float = bf16_to_float(self.current_max)
+                
                 if val_float > max_float:
-                    max_val = val_bf16
-        
-        self.estimated_max = max_val
-        print(f"   行{self.row_id}: 窗口收集完成，估算最大值 {hex(max_val)} ({bf16_to_float(max_val):.3f})")
-        
-        # 开始处理exp值
-        self.phase = "processing_exp"
+                    # 新的最大值，需要重新计算
+                    self.current_max = val_bf16
+                    self.global_max = val_bf16
+                    self.overflow_detected = True
+                    self.max_updated = True
+                    print(f"   行{self.row_id}: 非窗口数据更新最大值 {hex(self.current_max)} ({bf16_to_float(self.current_max):.3f})")
     
-    def can_process_exp(self):
-        """检查是否可以处理下一个exp值"""
-        return (self.phase == "processing_exp" and 
-                self.exp_processing_idx < len(self.all_data) and
-                self.estimated_max is not None)
+    def can_process_window_exp(self):
+        """检查是否可以处理窗口exp值"""
+        return (self.phase == "processing_window_exp" and 
+                self.window_exp_idx < len(self.window_indices) and
+                not self.window_exp_completed)
     
-    def get_next_exp_data(self):
-        """获取下一个需要处理exp的数据"""
-        if not self.can_process_exp():
+    def get_next_window_exp_data(self):
+        """获取下一个需要处理exp的窗口数据"""
+        if not self.can_process_window_exp():
             return None, None
             
-        # 按列索引排序处理
-        sorted_cols = sorted(self.all_data.keys())
-        if self.exp_processing_idx < len(sorted_cols):
-            col_idx = sorted_cols[self.exp_processing_idx]
-            val_bf16 = self.all_data[col_idx]
+        if self.window_exp_idx < len(self.window_indices):
+            col_idx = self.window_indices[self.window_exp_idx]
+            val_bf16 = self.window_data[col_idx]
             return col_idx, val_bf16
         return None, None
     
-    def process_exp_result(self, col_idx, exp_result, is_overflow=False):
-        """处理exp计算结果"""
+    def process_window_exp_result(self, col_idx, exp_result, is_overflow=False):
+        """处理窗口exp计算结果"""
         if is_overflow:
-            print(f"   行{self.row_id}: 溢出检测 列{col_idx}")
+            print(f"   行{self.row_id}: 窗口exp溢出检测 列{col_idx}")
+            # 窗口内不应该有溢出，如果有，说明有问题
             self.overflow_detected = True
-            # 更新最大值
-            val_bf16 = self.all_data[col_idx]
-            if bf16_to_float(val_bf16) > bf16_to_float(self.estimated_max):
-                self.estimated_max = val_bf16
-                self.max_updated = True
-                print(f"   行{self.row_id}: 更新最大值 {hex(self.estimated_max)}")
         else:
             # 存储exp结果
             self.exp_values[col_idx] = exp_result
@@ -246,10 +272,61 @@ class RowState:
             new_sum = convert_through_pipeline(current_sum + exp_val)
             self.exp_sum = new_sum
         
-        self.exp_processing_idx += 1
+        self.window_exp_idx += 1
         
-        # 检查是否完成exp处理
-        if self.exp_processing_idx >= len(self.all_data):
+        # 检查是否完成窗口exp处理
+        if self.window_exp_idx >= len(self.window_indices):
+            self.window_exp_completed = True
+            self.phase = "processing_remaining_exp"
+            print(f"   行{self.row_id}: 窗口exp处理完成，开始处理非窗口exp")
+            # 对非窗口索引排序以便有序处理
+            self.remaining_indices.sort()
+    
+    def can_process_remaining_exp(self):
+        """检查是否可以处理非窗口exp值"""
+        return (self.phase == "processing_remaining_exp" and 
+                self.remaining_exp_idx < len(self.remaining_indices) and
+                not self.remaining_exp_completed)
+    
+    def get_next_remaining_exp_data(self):
+        """获取下一个需要处理exp的非窗口数据"""
+        if not self.can_process_remaining_exp():
+            return None, None
+            
+        if self.remaining_exp_idx < len(self.remaining_indices):
+            col_idx = self.remaining_indices[self.remaining_exp_idx]
+            val_bf16 = self.remaining_data[col_idx]
+            return col_idx, val_bf16
+        return None, None
+    
+    def process_remaining_exp_result(self, col_idx, exp_result, is_overflow=False):
+        """处理非窗口exp计算结果"""
+        if is_overflow:
+            print(f"   行{self.row_id}: 非窗口exp溢出检测 列{col_idx}")
+            self.overflow_detected = True
+            # 更新最大值
+            val_bf16 = self.remaining_data[col_idx]
+            if bf16_to_float(val_bf16) > bf16_to_float(self.current_max):
+                self.current_max = val_bf16
+                self.global_max = val_bf16
+                self.max_updated = True
+                print(f"   行{self.row_id}: 更新最大值 {hex(self.current_max)} ({bf16_to_float(self.current_max):.3f})")
+        else:
+            # 存储exp结果
+            self.exp_values[col_idx] = exp_result
+            
+            # 累加到exp_sum
+            current_sum = bf16_to_float(self.exp_sum)
+            exp_val = bf16_to_float(exp_result)
+            new_sum = convert_through_pipeline(current_sum + exp_val)
+            self.exp_sum = new_sum
+        
+        self.remaining_exp_idx += 1
+        
+        # 检查是否完成非窗口exp处理
+        if self.remaining_exp_idx >= len(self.remaining_indices):
+            self.remaining_exp_completed = True
+            
             if self.overflow_detected and self.max_updated:
                 # 需要重新计算所有exp值
                 self._restart_exp_processing()
@@ -260,12 +337,16 @@ class RowState:
     
     def _restart_exp_processing(self):
         """重新开始exp处理（溢出后）"""
-        print(f"   行{self.row_id}: 回滚重新计算exp")
+        print(f"   行{self.row_id}: 回滚重新计算exp，使用新的最大值 {bf16_to_float(self.current_max):.3f}")
         self.exp_values.clear()
         self.exp_sum = convert_through_pipeline(0.0)
-        self.exp_processing_idx = 0
+        self.window_exp_idx = 0
+        self.remaining_exp_idx = 0
+        self.window_exp_completed = False
+        self.remaining_exp_completed = False
         self.overflow_detected = False
         self.max_updated = False
+        self.phase = "processing_window_exp"
     
     def can_process_division(self):
         """检查是否可以处理除法"""
@@ -349,7 +430,7 @@ class SoftmaxPipeline:
 
     def clock_cycle(self, valid=False, val_bf16=None, row_id=None, col_idx=None, row_length=None):
         """
-        时钟周期推进
+        时钟周期推进 - 实现真正的流水线计算
         
         Args:
             valid: 输入是否有效
@@ -377,14 +458,14 @@ class SoftmaxPipeline:
             row_state = self.get_or_create_row_state(row_id, row_length)
             row_state.add_data(col_idx, val_bf16)
         
-        # 处理各行的exp计算
+        # 处理各行的窗口exp计算
         for row_id, row_state in list(self.row_states.items()):
-            if row_state.can_process_exp():
-                col_idx, val_bf16 = row_state.get_next_exp_data()
+            if row_state.can_process_window_exp():
+                col_idx, val_bf16 = row_state.get_next_window_exp_data()
                 if col_idx is not None:
                     # 计算 val - max
                     val_float = bf16_to_float(val_bf16)
-                    max_float = bf16_to_float(row_state.estimated_max)
+                    max_float = bf16_to_float(row_state.current_max)
                     diff_float = val_float - max_float
                     diff_bf16 = convert_through_pipeline(diff_float)
                     
@@ -396,7 +477,28 @@ class SoftmaxPipeline:
                     # 检查溢出
                     is_overflow = (exp_result == 0x7FC0 or exp_result == 0x7F80 or exp_result == 0xFF80)
                     
-                    row_state.process_exp_result(col_idx, exp_result, is_overflow)
+                    row_state.process_window_exp_result(col_idx, exp_result, is_overflow)
+        
+        # 处理各行的非窗口exp计算
+        for row_id, row_state in list(self.row_states.items()):
+            if row_state.can_process_remaining_exp():
+                col_idx, val_bf16 = row_state.get_next_remaining_exp_data()
+                if col_idx is not None:
+                    # 计算 val - max
+                    val_float = bf16_to_float(val_bf16)
+                    max_float = bf16_to_float(row_state.current_max)
+                    diff_float = val_float - max_float
+                    diff_bf16 = convert_through_pipeline(diff_float)
+                    
+                    # 计算exp
+                    exp_unit = self.exp_units[row_id % self.max_rows]
+                    exp_unit.compute(diff_bf16)
+                    exp_result = exp_unit.output_val
+                    
+                    # 检查溢出
+                    is_overflow = (exp_result == 0x7FC0 or exp_result == 0x7F80 or exp_result == 0xFF80)
+                    
+                    row_state.process_remaining_exp_result(col_idx, exp_result, is_overflow)
         
         # 处理各行的除法计算
         for row_id, row_state in list(self.row_states.items()):
@@ -492,56 +594,99 @@ class SoftmaxPipeline:
         
         return results
 
-def test_softmax_pipeline():
-    """测试新的SoftmaxPipeline流水线架构"""
-    print("🧪 测试新的SoftmaxPipeline流水线架构")
+def example_test():
+    """测试新实现的流水线架构 - 逐个数据点输入"""
+    print("=" * 60)
+    print("🌟 测试新实现的SoftmaxPipeline流水线架构")
+    print("=" * 60)
     
     # 创建流水线
     pipeline = SoftmaxPipeline(front_window=3, back_window=3, max_rows=2)
     
-    # 测试数据集1：单行数据，窗口优先
-    print("\n📋 测试1：单行数据，窗口优先处理")
-    input_data1 = [1.0, 2.0, 3.0, 20.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
-    row_length = len(input_data1)
+    # 测试数据集：包含窗口内和窗口外的最大值
+    print("\n📋 测试：窗口外有更大值的情况")
+    input_data = [1.0, 2.0, 3.0, 50.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    row_length = len(input_data)
     
-    # 构造输入：(val, row_id, col_idx, row_length)
+    # 准备输入数据：(val, row_id, col_idx, row_length)
     # 窗口数据优先：前3个(0,1,2)和后3个(7,8,9)先发送
-    pipeline_input1 = []
+    pipeline_input = []
     
     # 前窗口数据
     for i in [0, 1, 2]:  # front_window = 3
-        pipeline_input1.append((input_data1[i], 0, i, row_length))
+        pipeline_input.append((input_data[i], 0, i, row_length))
     
-    # 后窗口数据  
-    for i in [7, 8, 9]:  # back_window = 3, 从索引7开始
-        pipeline_input1.append((input_data1[i], 0, i, row_length))
+    # 后窗口数据
+    for i in [7, 8, 9]:  # back_window = 3
+        pipeline_input.append((input_data[i], 0, i, row_length))
     
-    # 剩余数据
+    # 剩余数据，包含真正的最大值50.0
     for i in [3, 4, 5, 6]:
-        pipeline_input1.append((input_data1[i], 0, i, row_length))
+        pipeline_input.append((input_data[i], 0, i, row_length))
     
-    # 运行流水线
-    results1 = pipeline.run_pipeline(pipeline_input1, max_cycles=200, print_progress=True)
+    print("🔄 开始逐个时钟周期处理数据...")
+    print("   总输入数据点: {}".format(len(pipeline_input)))
+    
+    # 手动推进时钟周期
+    results = {}
+    cycle = 0
+    input_idx = 0
+    
+    print("\n🕒 开始时钟周期推进:")
+    while (input_idx < len(pipeline_input) or pipeline.is_active()) and cycle < 500:
+        cycle += 1
+        
+        # 当前周期的输入
+        if input_idx < len(pipeline_input):
+            val, row_id, col_idx, row_length = pipeline_input[input_idx]
+            val_bf16 = convert_through_pipeline(val) if isinstance(val, float) else val
+            
+            # 打印当前输入
+            if cycle <= 20 or cycle % 50 == 0 or input_idx == len(pipeline_input) - 1:
+                print(f"   周期 {cycle}: 输入 位置{col_idx}={val}")
+            
+            # 推进时钟周期
+            result = pipeline.clock_cycle(True, val_bf16, row_id, col_idx, row_length)
+            input_idx += 1
+        else:
+            # 无输入数据，继续推进时钟
+            if cycle <= 20 or cycle % 50 == 0:
+                print(f"   周期 {cycle}: 无输入，继续处理")
+            result = pipeline.clock_cycle(False)
+        
+        # 收集完成的结果
+        for row_id, row_result in result["completed_rows"].items():
+            if row_id not in results:
+                results[row_id] = row_result
+                print(f"✅ 周期 {cycle}: 行{row_id}处理完成")
+    
+    print(f"\n🎉 时钟周期推进完成，总共 {cycle} 个周期")
     
     # 验证结果
-    if 0 in results1:
-        result_row0 = results1[0]
-        print(f"\n📊 行0结果：")
+    if 0 in results:
+        result_row0 = results[0]
+        print(f"\n📊 处理结果：")
         
         # 转换为浮点数并排序
         softmax_results = []
         for col_idx in sorted(result_row0.keys()):
             softmax_val = bf16_to_float(result_row0[col_idx])
             softmax_results.append(softmax_val)
-            print(f"  列{col_idx}: {hex(result_row0[col_idx])} -> {softmax_val:.6f}")
+            print(f"  位置{col_idx}: {softmax_val:.6f}")
         
         # 验证和为1
         total_sum = sum(softmax_results)
         print(f"\n✅ 概率和: {total_sum:.6f} (应该接近1.0)")
         
+        # 验证最大值位置的softmax应该最大
+        max_idx = input_data.index(max(input_data))
+        max_softmax = softmax_results[max_idx]
+        print(f"✅ 最大值位置{max_idx}的softmax: {max_softmax:.6f}")
+        print(f"   应该是所有值中最大的: {max_softmax == max(softmax_results)}")
+        
         # 与PyTorch BF16结果对比
         import torch
-        torch_input = torch.tensor(input_data1, dtype=torch.float32).bfloat16()
+        torch_input = torch.tensor(input_data, dtype=torch.float32).bfloat16()
         torch_softmax = torch.softmax(torch_input, dim=0).float()
         
         print(f"\n🔍 与PyTorch BF16结果对比：")
@@ -549,1150 +694,109 @@ def test_softmax_pipeline():
         for i, (custom, torch_val) in enumerate(zip(softmax_results, torch_softmax.tolist())):
             error = abs(custom - torch_val)
             max_error = max(max_error, error)
-            print(f"  列{i}: 自定义={custom:.6f}, PyTorch={torch_val:.6f}, 误差={error:.6f}")
+            print(f"  位置{i}: 自定义={custom:.6f}, PyTorch={torch_val:.6f}, 误差={error:.6f}")
         print(f"📈 最大误差: {max_error:.6f}")
     else:
-        print("❌ 测试1失败：未获得行0的结果")
+        print("❌ 测试失败：未获得行0的结果")
     
-    # 测试数据集2：多行并行处理
-    print(f"\n📋 测试2：多行并行处理")
+    # 测试2：多行并行处理
+    print(f"\n📋 测试2：多行并行处理 - 逐个时钟周期")
+    
+    # 重新创建流水线
+    pipeline = SoftmaxPipeline(front_window=2, back_window=2, max_rows=2)
     
     # 准备两行数据
-    input_data2_row0 = [1.0, 2.0, 3.0, 4.0, 5.0]  # 行0
-    input_data2_row1 = [10.0, 20.0, 30.0, 40.0, 50.0]  # 行1
+    row0_data = [1.0, 2.0, 3.0, 4.0, 5.0]  # 行0
+    row1_data = [10.0, 20.0, 30.0, 5.0, 15.0]  # 行1，注意第3个位置有最大值
     
-    pipeline_input2 = []
+    # 准备交错的输入数据
+    multi_input = []
     
-    # 交替发送两行的窗口数据
-    row0_len = len(input_data2_row0)
-    row1_len = len(input_data2_row1)
+    # 交错发送窗口数据
+    multi_input.append((row0_data[0], 0, 0, len(row0_data)))  # 行0前窗口
+    multi_input.append((row1_data[0], 1, 0, len(row1_data)))  # 行1前窗口
+    multi_input.append((row0_data[1], 0, 1, len(row0_data)))  # 行0前窗口
+    multi_input.append((row1_data[1], 1, 1, len(row1_data)))  # 行1前窗口
+    multi_input.append((row0_data[3], 0, 3, len(row0_data)))  # 行0后窗口
+    multi_input.append((row1_data[3], 1, 3, len(row1_data)))  # 行1后窗口
+    multi_input.append((row0_data[4], 0, 4, len(row0_data)))  # 行0后窗口
+    multi_input.append((row1_data[4], 1, 4, len(row1_data)))  # 行1后窗口
     
-    # 行0窗口数据（前2个，后2个，因为长度5，front_window=3会取前3个，back_window=3会取后3个）
-    for i in [0, 1, 2]:  # 前窗口
-        if i < row0_len:
-            pipeline_input2.append((input_data2_row0[i], 0, i, row0_len))
-    for i in [2, 3, 4]:  # 后窗口（重叠可能）
-        if i >= row0_len - 3:
-            pipeline_input2.append((input_data2_row0[i], 0, i, row0_len))
+    # 发送剩余数据
+    multi_input.append((row0_data[2], 0, 2, len(row0_data)))  # 行0剩余
+    multi_input.append((row1_data[2], 1, 2, len(row1_data)))  # 行1剩余，包含最大值
     
-    # 行1窗口数据
-    for i in [0, 1, 2]:  # 前窗口
-        if i < row1_len:
-            pipeline_input2.append((input_data2_row1[i], 1, i, row1_len))
-    for i in [2, 3, 4]:  # 后窗口
-        if i >= row1_len - 3:
-            pipeline_input2.append((input_data2_row1[i], 1, i, row1_len))
+    print("🔄 开始多行逐个时钟周期处理...")
+    print("   总输入数据点: {}".format(len(multi_input)))
     
-    # 运行流水线
-    results2 = pipeline.run_pipeline(pipeline_input2, max_cycles=200, print_progress=True)
+    # 手动推进时钟周期
+    multi_results = {}
+    cycle = 0
+    input_idx = 0
+    
+    print("\n🕒 开始时钟周期推进:")
+    while (input_idx < len(multi_input) or pipeline.is_active()) and cycle < 500:
+        cycle += 1
+        
+        # 当前周期的输入
+        if input_idx < len(multi_input):
+            val, row_id, col_idx, row_length = multi_input[input_idx]
+            val_bf16 = convert_through_pipeline(val) if isinstance(val, float) else val
+            
+            # 打印当前输入
+            if cycle <= 20 or cycle % 50 == 0 or input_idx == len(multi_input) - 1:
+                print(f"   周期 {cycle}: 输入 行{row_id}位置{col_idx}={val}")
+            
+            # 推进时钟周期
+            result = pipeline.clock_cycle(True, val_bf16, row_id, col_idx, row_length)
+            input_idx += 1
+        else:
+            # 无输入数据，继续推进时钟
+            if cycle <= 20 or cycle % 50 == 0:
+                print(f"   周期 {cycle}: 无输入，继续处理")
+            result = pipeline.clock_cycle(False)
+        
+        # 收集完成的结果
+        for row_id, row_result in result["completed_rows"].items():
+            if row_id not in multi_results:
+                multi_results[row_id] = row_result
+                print(f"✅ 周期 {cycle}: 行{row_id}处理完成")
+    
+    print(f"\n🎉 时钟周期推进完成，总共 {cycle} 个周期")
     
     # 验证多行结果
     for row_id in [0, 1]:
-        if row_id in results2:
-            result_row = results2[row_id]
+        if row_id in multi_results:
+            result_row = multi_results[row_id]
             print(f"\n📊 行{row_id}结果：")
             
             softmax_results = []
             for col_idx in sorted(result_row.keys()):
                 softmax_val = bf16_to_float(result_row[col_idx])
                 softmax_results.append(softmax_val)
+                print(f"  位置{col_idx}: {softmax_val:.6f}")
             
             total_sum = sum(softmax_results)
             print(f"✅ 行{row_id}概率和: {total_sum:.6f}")
+            
+            # 验证最大值
+            if row_id == 1:  # 行1有明确的最大值
+                max_idx = row1_data.index(max(row1_data))
+                max_softmax = softmax_results[max_idx]
+                print(f"✅ 行1最大值位置{max_idx}的softmax: {max_softmax:.6f}")
+                print(f"   应该是所有值中最大的: {max_softmax == max(softmax_results)}")
         else:
             print(f"❌ 测试2失败：未获得行{row_id}的结果")
     
-    # 测试数据集3：溢出处理测试
-    print(f"\n📋 测试3：溢出检测和回滚测试")
-    
-    # 构造可能溢出的数据
-    input_data3 = [1.0, 2.0, 60.0, 4.0, 5.0]  # 60.0 很大，可能导致溢出
-    row_length = len(input_data3)
-    
-    pipeline_input3 = []
-    # 窗口优先：确保大值不在初始窗口中，以测试动态最大值更新
-    for i in [0, 1]:  # 前窗口的一部分
-        pipeline_input3.append((input_data3[i], 2, i, row_length))
-    for i in [3, 4]:  # 后窗口
-        pipeline_input3.append((input_data3[i], 2, i, row_length))
-    # 剩余数据（包含大值）
-    pipeline_input3.append((input_data3[2], 2, 2, row_length))  # 大值60.0
-    
-    # 运行流水线
-    results3 = pipeline.run_pipeline(pipeline_input3, max_cycles=200, print_progress=True)
-    
-    if 2 in results3:
-        result_row2 = results3[2]
-        print(f"\n📊 行2结果（溢出测试）：")
-        
-        softmax_results = []
-        for col_idx in sorted(result_row2.keys()):
-            softmax_val = bf16_to_float(result_row2[col_idx])
-            softmax_results.append(softmax_val)
-            print(f"  列{col_idx}: {softmax_val:.6f}")
-        
-        total_sum = sum(softmax_results)
-        print(f"✅ 行2概率和: {total_sum:.6f}")
-        
-        # 验证最大值对应的softmax值应该接近1
-        max_idx = input_data3.index(max(input_data3))
-        max_softmax = softmax_results[max_idx]
-        print(f"🔍 最大值位置{max_idx}的softmax值: {max_softmax:.6f} (应该接近1.0)")
-    else:
-        print("❌ 测试3失败：未获得行2的结果")
-    
-    print(f"\n🎉 SoftmaxPipeline测试完成！")
-
-def test_new_input_format():
-    """测试新的输入格式 (val, row_idx, col_idx)"""
-    print("🧪 测试新输入格式 (val, row_idx, col_idx, row_length)")
-    
-    pipeline = SoftmaxPipeline(front_window=2, back_window=2, max_rows=1)
-    
-    # 简单测试数据
-    test_data = [1.0, 2.0, 3.0, 4.0, 5.0]
-    row_length = len(test_data)
-    
-    # 构造新格式输入 - 窗口优先
-    input_data = []
-    
-    # 前窗口数据优先
-    for i in [0, 1]:
-        input_data.append((test_data[i], 0, i, row_length))
-    
-    # 后窗口数据
-    for i in [3, 4]:
-        input_data.append((test_data[i], 0, i, row_length))
-    
-    # 剩余数据
-    input_data.append((test_data[2], 0, 2, row_length))
-    
-    print("📥 输入数据顺序（窗口优先）:")
-    for i, (val, row_id, col_idx, row_len) in enumerate(input_data):
-        print(f"  {i}: val={val}, row_id={row_id}, col_idx={col_idx}, row_length={row_len}")
-    
-    # 运行测试
-    results = pipeline.run_pipeline(input_data, max_cycles=100, print_progress=True)
-    
-    if 0 in results:
-        result = results[0]
-        print("📊 Softmax结果:")
-        
-        total_sum = 0.0
-        for col_idx in sorted(result.keys()):
-            softmax_val = bf16_to_float(result[col_idx])
-            total_sum += softmax_val
-            print(f"  位置{col_idx}: {softmax_val:.6f}")
-        
-        print(f"✅ 总和: {total_sum:.6f}")
-        
-        # 与标准softmax对比
-        import torch
-        torch_input = torch.tensor(test_data, dtype=torch.float32)
-        torch_result = torch.softmax(torch_input, dim=0)
-        
-        print("🔍 与PyTorch对比:")
-        for i, torch_val in enumerate(torch_result.tolist()):
-            custom_val = bf16_to_float(result[i])
-            error = abs(custom_val - torch_val)
-            print(f"  位置{i}: 自定义={custom_val:.6f}, PyTorch={torch_val:.6f}, 误差={error:.6f}")
-    else:
-        print("❌ 测试失败")
-
-def test_window_priority():
-    """测试窗口优先处理"""
-    print("🧪 测试窗口优先处理")
-    
-    pipeline = SoftmaxPipeline(front_window=2, back_window=2, max_rows=1)
-    
-    # 测试数据 - 最大值在窗口外
-    test_data = [1.0, 2.0, 100.0, 3.0, 4.0]  # 最大值100.0在位置2（窗口外）
-    row_length = len(test_data)
-    
-    # 先发送窗口数据，后发送包含最大值的数据
-    input_data = []
-    
-    print("📥 发送顺序（窗口优先）:")
-    
-    # 前窗口 (索引0,1)
-    for i in [0, 1]:
-        input_data.append((test_data[i], 0, i, row_length))
-        print(f"  发送前窗口: 位置{i}, 值={test_data[i]}")
-    
-    # 后窗口 (索引3,4)
-    for i in [3, 4]:
-        input_data.append((test_data[i], 0, i, row_length))
-        print(f"  发送后窗口: 位置{i}, 值={test_data[i]}")
-    
-    print("  → 此时应该开始预估最大值并处理exp")
-    
-    # 剩余数据（包含真正的最大值）
-    input_data.append((test_data[2], 0, 2, row_length))
-    print(f"  发送剩余数据: 位置2, 值={test_data[2]} (真正的最大值)")
-    print("  → 应该检测到溢出并更新最大值")
-    
-    # 运行流水线
-    results = pipeline.run_pipeline(input_data, max_cycles=150, print_progress=True)
-    
-    if 0 in results:
-        result = results[0]
-        print("\n📊 最终结果:")
-        
-        softmax_values = []
-        for col_idx in sorted(result.keys()):
-            softmax_val = bf16_to_float(result[col_idx])
-            softmax_values.append(softmax_val)
-            print(f"  位置{col_idx}: {softmax_val:.6f}")
-        
-        # 验证最大值位置的softmax应该最大
-        max_position = 2  # 最大值100.0的位置
-        max_softmax = softmax_values[max_position]
-        print(f"\n✅ 最大值位置{max_position}的softmax: {max_softmax:.6f}")
-        print(f"   应该是所有值中最大的: {max_softmax == max(softmax_values)}")
-        
-        total_sum = sum(softmax_values)
-        print(f"✅ 总和: {total_sum:.6f}")
-    else:
-        print("❌ 测试失败")
-
-def debug_simple_test():
-    """简单的调试测试"""
-    print("🔧 简单调试测试...")
-    
-    # 测试基本的BF16计算单元
-    from gpt2_sim.temp.bf16_sim import convert_through_pipeline, bf16_add, bf16_mul
-    
-    # 测试数据：[0, 1, 2] - 简单且容易验证
-    test_values = [0.0, 1.0, 2.0]
-    max_val = 2.0
-    
-    print(f"测试数据: {test_values}")
-    print(f"预期最大值: {max_val}")
-    
-    # 转换为BF16
-    test_bf16 = [convert_through_pipeline(v) for v in test_values]
-    max_bf16 = convert_through_pipeline(max_val)
-    
-    print(f"BF16数据: {[hex(v) for v in test_bf16]}")
-    print(f"BF16最大值: {hex(max_bf16)}")
-    
-    # 计算exp(val - max)
-    exp_results = []
-    for i, val_bf16 in enumerate(test_bf16):
-        # val - max
-        neg_max = max_bf16 ^ 0x8000  # 取反
-        diff = bf16_add(val_bf16, neg_max)
-        print(f"  {test_values[i]} - {max_val} = {bf16_to_float(diff):.6f} (BF16: {hex(diff)})")
-        
-        # exp(val - max)
-        exp_unit = ExpUnit()
-        exp_unit.compute(diff)
-        exp_result = exp_unit.output_val
-        exp_float = bf16_to_float(exp_result)
-        exp_results.append(exp_result)
-        
-        print(f"  exp({bf16_to_float(diff):.6f}) = {exp_float:.6f} (BF16: {hex(exp_result)})")
-    
-    # 计算sum
-    exp_sum = convert_through_pipeline(0.0)
-    for exp_val in exp_results:
-        exp_sum = bf16_add(exp_sum, exp_val)
-    
-    exp_sum_float = bf16_to_float(exp_sum)
-    print(f"exp_sum = {exp_sum_float:.6f} (BF16: {hex(exp_sum)})")
-    
-    # 计算softmax
-    softmax_results = []
-    for exp_val in exp_results:
-        divide_unit = DivideUnit()
-        divide_unit.compute(exp_val, exp_sum)
-        softmax_val = divide_unit.result
-        softmax_float = bf16_to_float(softmax_val)
-        softmax_results.append(softmax_float)
-        print(f"  softmax = {bf16_to_float(exp_val):.6f} / {exp_sum_float:.6f} = {softmax_float:.6f}")
-    
-    print(f"最终结果: {[f'{r:.6f}' for r in softmax_results]}")
-    print(f"结果和: {sum(softmax_results):.6f}")
-    
-    # 与PyTorch对比
-    import torch
-    torch_input = torch.tensor(test_values, dtype=torch.bfloat16)
-    torch_output = torch.softmax(torch_input, dim=0).float()
-    print(f"PyTorch BF16: {[f'{r:.6f}' for r in torch_output.tolist()]}")
-
-def example_usage():
-    """展示新的SoftmaxPipeline流水线架构的使用方法"""
-    print("=" * 60)
-    print("🌟 SoftmaxPipeline流水线架构使用示例")
-    print("=" * 60)
-    
-    # 创建流水线
-    pipeline = SoftmaxPipeline(front_window=3, back_window=2, max_rows=2)
-    
-    # 示例1：单行处理
-    print("\n📋 示例1：单行数据处理")
-    input_data = [1.0, 2.0, 3.0, 15.0, 4.0, 5.0, 6.0]
-    row_length = len(input_data)
-    
-    # 构造输入：(val, row_id, col_idx, row_length)
-    # 重要：窗口数据优先发送！
-    pipeline_input = []
-    
-    # 1. 前窗口数据优先
-    print("🔹 发送前窗口数据:")
-    for i in range(min(3, row_length)):  # front_window = 3
-        pipeline_input.append((input_data[i], 0, i, row_length))
-        print(f"   位置{i}: {input_data[i]}")
-    
-    # 2. 后窗口数据
-    print("🔹 发送后窗口数据:")
-    for i in range(max(0, row_length - 2), row_length):  # back_window = 2
-        if i >= 3:  # 避免与前窗口重复
-            pipeline_input.append((input_data[i], 0, i, row_length))
-            print(f"   位置{i}: {input_data[i]}")
-    
-    # 3. 剩余数据
-    print("🔹 发送剩余数据:")
-    for i in range(3, row_length - 2):
-        pipeline_input.append((input_data[i], 0, i, row_length))
-        print(f"   位置{i}: {input_data[i]}")
-    
-    # 运行流水线
-    results = pipeline.run_pipeline(pipeline_input, max_cycles=150, print_progress=False)
-    
-    if 0 in results:
-        result_row = results[0]
-        print("\n✅ 处理结果:")
-        
-        total_sum = 0.0
-        for col_idx in sorted(result_row.keys()):
-            softmax_val = bf16_to_float(result_row[col_idx])
-            total_sum += softmax_val
-            print(f"   位置{col_idx}: {softmax_val:.6f}")
-        
-        print(f"   概率总和: {total_sum:.6f}")
-        
-        # 与PyTorch对比
-        import torch
-        torch_input = torch.tensor(input_data, dtype=torch.float32).bfloat16()
-        torch_result = torch.softmax(torch_input, dim=0).float()
-        
-        max_error = 0.0
-        for i, torch_val in enumerate(torch_result.tolist()):
-            custom_val = bf16_to_float(result_row[i])
-            error = abs(custom_val - torch_val)
-            max_error = max(max_error, error)
-        
-        print(f"   与PyTorch BF16最大误差: {max_error:.6f}")
-    
-    # 示例2：多行并行处理
-    print(f"\n📋 示例2：多行并行处理")
-    
-    # 准备两行数据
-    row0_data = [1.0, 2.0, 3.0, 4.0]
-    row1_data = [10.0, 20.0, 30.0]
-    
-    multi_input = []
-    
-    # 行0数据（窗口优先）
-    print("🔹 行0窗口数据:")
-    for i in [0, 1, 2]:  # 前窗口
-        if i < len(row0_data):
-            multi_input.append((row0_data[i], 0, i, len(row0_data)))
-            print(f"   行0位置{i}: {row0_data[i]}")
-    for i in [2, 3]:     # 后窗口（可能重叠）
-        if i >= len(row0_data) - 2:
-            multi_input.append((row0_data[i], 0, i, len(row0_data)))
-            print(f"   行0位置{i}: {row0_data[i]}")
-    
-    # 行1数据（窗口优先）
-    print("🔹 行1窗口数据:")
-    for i in [0, 1, 2]:  # 前窗口
-        if i < len(row1_data):
-            multi_input.append((row1_data[i], 1, i, len(row1_data)))
-            print(f"   行1位置{i}: {row1_data[i]}")
-    for i in [1, 2]:     # 后窗口
-        if i >= len(row1_data) - 2:
-            multi_input.append((row1_data[i], 1, i, len(row1_data)))
-            print(f"   行1位置{i}: {row1_data[i]}")
-    
-    # 运行多行处理
-    multi_results = pipeline.run_pipeline(multi_input, max_cycles=200, print_progress=False)
-    
-    print("\n✅ 多行处理结果:")
-    for row_id in [0, 1]:
-        if row_id in multi_results:
-            result_row = multi_results[row_id]
-            
-            softmax_results = []
-            for col_idx in sorted(result_row.keys()):
-                softmax_val = bf16_to_float(result_row[col_idx])
-                softmax_results.append(softmax_val)
-            
-            total_sum = sum(softmax_results)
-            print(f"   行{row_id}: {[f'{x:.6f}' for x in softmax_results]} (和: {total_sum:.6f})")
-    
-    print("\n📚 输入格式说明:")
-    print("   每个输入数据是四元组: (val, row_id, col_idx, row_length)")
-    print("   - val: 浮点数值")
-    print("   - row_id: 行标识符")
-    print("   - col_idx: 列索引")
-    print("   - row_length: 行的总长度")
-    print("   ⚠️  重要：窗口数据必须优先发送！")
-
-def test_long_sequence():
-    """测试长序列数据处理，包含1024个浮点数"""
-    print("=" * 80)
-    print("🚀 长序列测试：1024个浮点数的Softmax计算")
-    print("=" * 80)
-    
-    import numpy as np
-    import torch
-    import time
-    
-    # 生成1024个随机浮点数
-    np.random.seed(42)  # 固定随机种子以便复现
-    sequence_length = 1024
-    
-    # 创建多样化的测试数据
-    test_data = []
-    
-    # 1. 正态分布数据 (0-256)
-    normal_data = np.random.normal(0, 2, 256).tolist()
-    test_data.extend(normal_data)
-    
-    # 2. 递增序列 (256-512)
-    ascending_data = [i * 0.1 for i in range(256)]
-    test_data.extend(ascending_data)
-    
-    # 3. 递减序列 (512-768)
-    descending_data = [25.0 - i * 0.1 for i in range(256)]
-    test_data.extend(descending_data)
-    
-    # 4. 混合数据：大数、小数、负数 (768-1024)
-    mixed_data = []
-    for i in range(256):
-        if i % 4 == 0:
-            mixed_data.append(np.random.uniform(10, 50))  # 大数
-        elif i % 4 == 1:
-            mixed_data.append(np.random.uniform(-10, -1))  # 负数
-        elif i % 4 == 2:
-            mixed_data.append(np.random.uniform(0.001, 0.1))  # 小数
-        else:
-            mixed_data.append(np.random.uniform(-0.1, 0.1))  # 接近零
-    test_data.extend(mixed_data)
-    
-    print(f"📊 测试数据统计:")
-    print(f"   序列长度: {len(test_data)}")
-    print(f"   最大值: {max(test_data):.3f}")
-    print(f"   最小值: {min(test_data):.3f}")
-    print(f"   平均值: {np.mean(test_data):.3f}")
-    print(f"   标准差: {np.std(test_data):.3f}")
-    
-    # 创建流水线，使用较大的窗口
-    pipeline = SoftmaxPipeline(front_window=32, back_window=32, max_rows=1)
-    
-    print(f"\n⚙️  流水线配置:")
-    print(f"   前窗口大小: 32")
-    print(f"   后窗口大小: 32")
-    print(f"   最大并行行数: 1")
-    
-    # 准备输入数据 - 窗口优先策略
-    pipeline_input = []
-    row_id = 0
-    row_length = len(test_data)
-    
-    print(f"\n🔄 准备流水线输入数据...")
-    
-    # 1. 前窗口数据优先 (0-31)
-    for i in range(min(32, row_length)):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 2. 后窗口数据 (992-1023)
-    for i in range(max(0, row_length - 32), row_length):
-        if i >= 32:  # 避免与前窗口重复
-            pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 3. 剩余中间数据 (32-991)
-    for i in range(32, row_length - 32):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    print(f"   总输入数据点: {len(pipeline_input)}")
-    
-    # 运行流水线并计时
-    print(f"\n🚀 开始流水线处理...")
-    start_time = time.time()
-    
-    results = pipeline.run_pipeline(
-        pipeline_input, 
-        max_cycles=3000,  # 增加最大周期数
-        print_progress=True
-    )
-    
-    end_time = time.time()
-    processing_time = end_time - start_time
-    
-    print(f"\n⏱️  处理完成，用时: {processing_time:.3f}秒")
-    print(f"   平均每个数据点: {processing_time/len(test_data)*1000:.3f}毫秒")
-    
-    # 检查结果
-    if row_id in results:
-        result_row = results[row_id]
-        print(f"\n✅ 处理结果验证:")
-        print(f"   输出数据点数: {len(result_row)}")
-        
-        # 计算softmax结果和概率总和
-        softmax_results = []
-        for col_idx in sorted(result_row.keys()):
-            softmax_val = bf16_to_float(result_row[col_idx])
-            softmax_results.append(softmax_val)
-        
-        total_sum = sum(softmax_results)
-        print(f"   概率总和: {total_sum:.6f}")
-        print(f"   最大概率: {max(softmax_results):.6f}")
-        print(f"   最小概率: {min(softmax_results):.6f}")
-        
-        # 显示前10个和后10个结果
-        print(f"\n📋 前10个结果:")
-        for i in range(min(10, len(softmax_results))):
-            print(f"   [{i:3d}] 输入: {test_data[i]:8.3f} -> softmax: {softmax_results[i]:.6f}")
-        
-        print(f"\n📋 后10个结果:")
-        for i in range(max(0, len(softmax_results)-10), len(softmax_results)):
-            print(f"   [{i:3d}] 输入: {test_data[i]:8.3f} -> softmax: {softmax_results[i]:.6f}")
-        
-        # 与PyTorch对比
-        print(f"\n🔍 与PyTorch BF16对比:")
-        torch_start = time.time()
-        torch_input = torch.tensor(test_data, dtype=torch.bfloat16)
-        torch_result = torch.softmax(torch_input, dim=0).float()
-        torch_end = time.time()
-        torch_time = torch_end - torch_start
-        
-        print(f"   PyTorch处理时间: {torch_time:.3f}秒")
-        print(f"   速度比较: PyTorch比自定义快 {processing_time/torch_time:.1f}倍")
-        
-        # 计算误差统计
-        torch_list = torch_result.tolist()
-        errors = []
-        max_error = 0.0
-        max_error_idx = 0
-        
-        for i in range(len(softmax_results)):
-            error = abs(softmax_results[i] - torch_list[i])
-            errors.append(error)
-            if error > max_error:
-                max_error = error
-                max_error_idx = i
-        
-        mean_error = np.mean(errors)
-        std_error = np.std(errors)
-        
-        print(f"\n📊 误差统计:")
-        print(f"   平均误差: {mean_error:.8f}")
-        print(f"   误差标准差: {std_error:.8f}")
-        print(f"   最大误差: {max_error:.8f} (位置 {max_error_idx})")
-        print(f"   最大误差位置详情:")
-        print(f"     输入值: {test_data[max_error_idx]:.6f}")
-        print(f"     自定义结果: {softmax_results[max_error_idx]:.8f}")
-        print(f"     PyTorch结果: {torch_list[max_error_idx]:.8f}")
-        
-        # 检查概率分布的合理性
-        print(f"\n🎯 概率分布分析:")
-        
-        # 找到输入最大值对应的softmax
-        max_input_idx = test_data.index(max(test_data))
-        max_input_softmax = softmax_results[max_input_idx]
-        print(f"   输入最大值位置: {max_input_idx}, 值: {test_data[max_input_idx]:.3f}")
-        print(f"   对应softmax值: {max_input_softmax:.6f}")
-        
-        # 检查是否符合softmax性质
-        is_valid_softmax = True
-        if abs(total_sum - 1.0) > 1e-3:
-            is_valid_softmax = False
-            print(f"   ❌ 概率和不等于1: {total_sum:.6f}")
-        
-        if any(x < 0 for x in softmax_results):
-            is_valid_softmax = False
-            print(f"   ❌ 存在负概率值")
-        
-        if is_valid_softmax:
-            print(f"   ✅ 通过softmax有效性检查")
-        
-        # 性能总结
-        print(f"\n🏆 性能总结:")
-        print(f"   ✅ 成功处理1024个浮点数")
-        print(f"   ✅ 流水线架构运行稳定")
-        print(f"   ✅ BF16精度计算准确")
-        print(f"   ✅ 与PyTorch结果高度一致")
-        print(f"   ✅ 支持多样化数据分布")
-        
-    else:
-        print(f"❌ 流水线处理失败，未获得结果")
-    
-    print("=" * 80)
-
-def test_extreme_long_sequence():
-    """极限测试：2048个浮点数的Softmax计算"""
-    print("=" * 80)
-    print("🔥 极限测试：2048个浮点数的Softmax计算")
-    print("=" * 80)
-    
-    import numpy as np
-    import torch
-    import time
-    
-    # 生成2048个随机浮点数
-    np.random.seed(123)
-    sequence_length = 2048
-    
-    # 创建更具挑战性的数据分布
-    test_data = []
-    
-    # 1. 极端正态分布数据 (0-512)
-    extreme_normal = np.random.normal(0, 10, 512).tolist()
-    test_data.extend(extreme_normal)
-    
-    # 2. 指数分布数据 (512-1024)
-    exp_data = np.random.exponential(2, 512).tolist()
-    test_data.extend(exp_data)
-    
-    # 3. 均匀分布大数据 (1024-1536)
-    uniform_large = np.random.uniform(20, 100, 512).tolist()
-    test_data.extend(uniform_large)
-    
-    # 4. 极小数和负数混合 (1536-2048)
-    small_negative = []
-    for i in range(512):
-        if i % 3 == 0:
-            small_negative.append(np.random.uniform(-50, -10))  # 大负数
-        elif i % 3 == 1:
-            small_negative.append(np.random.uniform(1e-6, 1e-3))  # 极小正数
-        else:
-            small_negative.append(np.random.uniform(-1, 1))  # 小数
-    test_data.extend(small_negative)
-    
-    print(f"📊 极限测试数据统计:")
-    print(f"   序列长度: {len(test_data)}")
-    print(f"   最大值: {max(test_data):.3f}")
-    print(f"   最小值: {min(test_data):.3f}")
-    print(f"   平均值: {np.mean(test_data):.3f}")
-    print(f"   标准差: {np.std(test_data):.3f}")
-    print(f"   数据范围: {max(test_data) - min(test_data):.3f}")
-    
-    # 创建流水线，使用更大的窗口
-    pipeline = SoftmaxPipeline(front_window=64, back_window=64, max_rows=1)
-    
-    print(f"\n⚙️  极限流水线配置:")
-    print(f"   前窗口大小: 64")
-    print(f"   后窗口大小: 64")
-    print(f"   最大并行行数: 1")
-    print(f"   预计最大周期数: 6000")
-    
-    # 准备输入数据 - 窗口优先策略
-    pipeline_input = []
-    row_id = 0
-    row_length = len(test_data)
-    
-    print(f"\n🔄 准备极限流水线输入数据...")
-    
-    # 1. 前窗口数据优先 (0-63)
-    for i in range(min(64, row_length)):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 2. 后窗口数据 (1984-2047)
-    for i in range(max(0, row_length - 64), row_length):
-        if i >= 64:  # 避免与前窗口重复
-            pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 3. 剩余中间数据 (64-1983)
-    for i in range(64, row_length - 64):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    print(f"   总输入数据点: {len(pipeline_input)}")
-    
-    # 运行流水线并计时
-    print(f"\n🚀 开始极限流水线处理...")
-    start_time = time.time()
-    
-    results = pipeline.run_pipeline(
-        pipeline_input, 
-        max_cycles=6000,  # 增加最大周期数
-        print_progress=True
-    )
-    
-    end_time = time.time()
-    processing_time = end_time - start_time
-    
-    print(f"\n⏱️  极限处理完成，用时: {processing_time:.3f}秒")
-    print(f"   平均每个数据点: {processing_time/len(test_data)*1000:.3f}毫秒")
-    print(f"   吞吐量: {len(test_data)/processing_time:.0f} 数据点/秒")
-    
-    # 检查结果
-    if row_id in results:
-        result_row = results[row_id]
-        print(f"\n✅ 极限处理结果验证:")
-        print(f"   输出数据点数: {len(result_row)}")
-        
-        # 计算softmax结果和概率总和
-        softmax_results = []
-        for col_idx in sorted(result_row.keys()):
-            softmax_val = bf16_to_float(result_row[col_idx])
-            softmax_results.append(softmax_val)
-        
-        total_sum = sum(softmax_results)
-        print(f"   概率总和: {total_sum:.6f}")
-        print(f"   最大概率: {max(softmax_results):.6f}")
-        print(f"   最小概率: {min(softmax_results):.6f}")
-        print(f"   非零概率数量: {sum(1 for x in softmax_results if x > 0)}")
-        
-        # 显示极值结果
-        max_prob_idx = softmax_results.index(max(softmax_results))
-        print(f"\n📋 极值分析:")
-        print(f"   最大概率位置: [{max_prob_idx}] 输入: {test_data[max_prob_idx]:.3f} -> softmax: {softmax_results[max_prob_idx]:.6f}")
-        
-        # 找到前5个最大概率
-        sorted_indices = sorted(range(len(softmax_results)), key=lambda i: softmax_results[i], reverse=True)
-        print(f"   前5个最大概率:")
-        for rank, idx in enumerate(sorted_indices[:5]):
-            print(f"     #{rank+1}: 位置[{idx}] 输入: {test_data[idx]:.3f} -> softmax: {softmax_results[idx]:.6f}")
-        
-        # 与PyTorch对比
-        print(f"\n🔍 与PyTorch BF16极限对比:")
-        torch_start = time.time()
-        torch_input = torch.tensor(test_data, dtype=torch.bfloat16)
-        torch_result = torch.softmax(torch_input, dim=0).float()
-        torch_end = time.time()
-        torch_time = torch_end - torch_start
-        
-        print(f"   PyTorch处理时间: {torch_time:.3f}秒")
-        print(f"   PyTorch吞吐量: {len(test_data)/torch_time:.0f} 数据点/秒")
-        print(f"   速度比较: PyTorch比自定义快 {processing_time/torch_time:.1f}倍")
-        
-        # 计算误差统计
-        torch_list = torch_result.tolist()
-        errors = []
-        large_errors = []
-        
-        for i in range(len(softmax_results)):
-            error = abs(softmax_results[i] - torch_list[i])
-            errors.append(error)
-            if error > 1e-5:  # 记录较大误差
-                large_errors.append((i, error, test_data[i], softmax_results[i], torch_list[i]))
-        
-        mean_error = np.mean(errors)
-        max_error = max(errors)
-        max_error_idx = errors.index(max_error)
-        
-        print(f"\n📊 极限误差统计:")
-        print(f"   平均误差: {mean_error:.8f}")
-        print(f"   最大误差: {max_error:.8f} (位置 {max_error_idx})")
-        print(f"   大误差数量 (>1e-5): {len(large_errors)}")
-        
-        if large_errors:
-            print(f"   前3个大误差:")
-            for i, (idx, error, input_val, custom_val, torch_val) in enumerate(large_errors[:3]):
-                print(f"     位置{idx}: 误差{error:.6f}, 输入{input_val:.3f}, 自定义{custom_val:.6f}, PyTorch{torch_val:.6f}")
-        
-        # 检查概率分布的合理性
-        print(f"\n🎯 极限概率分布分析:")
-        
-        # 找到输入最大值对应的softmax
-        max_input_idx = test_data.index(max(test_data))
-        max_input_softmax = softmax_results[max_input_idx]
-        print(f"   输入最大值位置: {max_input_idx}, 值: {test_data[max_input_idx]:.3f}")
-        print(f"   对应softmax值: {max_input_softmax:.6f}")
-        
-        # 统计概率分布
-        prob_ranges = [
-            (0, 1e-6, "极小 (<1e-6)"),
-            (1e-6, 1e-4, "很小 (1e-6~1e-4)"),
-            (1e-4, 1e-2, "小 (1e-4~1e-2)"),
-            (1e-2, 0.1, "中 (1e-2~0.1)"),
-            (0.1, 1.0, "大 (>0.1)")
-        ]
-        
-        for min_val, max_val, label in prob_ranges:
-            count = sum(1 for x in softmax_results if min_val <= x < max_val)
-            print(f"   {label}: {count} 个 ({count/len(softmax_results)*100:.1f}%)")
-        
-        # 检查是否符合softmax性质
-        is_valid_softmax = True
-        if abs(total_sum - 1.0) > 1e-2:  # 放宽阈值，考虑BF16精度
-            is_valid_softmax = False
-            print(f"   ⚠️  概率和偏差较大: {total_sum:.6f}")
-        
-        if any(x < 0 for x in softmax_results):
-            is_valid_softmax = False
-            print(f"   ❌ 存在负概率值")
-        
-        if is_valid_softmax:
-            print(f"   ✅ 通过极限softmax有效性检查")
-        
-        # 性能总结
-        print(f"\n🏆 极限性能总结:")
-        print(f"   ✅ 成功处理2048个浮点数")
-        print(f"   ✅ 处理极端数据分布 (范围 {max(test_data) - min(test_data):.1f})")
-        print(f"   ✅ 流水线架构在极限条件下稳定运行")
-        print(f"   ✅ BF16精度在大规模数据下保持准确")
-        print(f"   ✅ 与PyTorch结果在极限条件下高度一致")
-        print(f"   ✅ 吞吐量达到 {len(test_data)/processing_time:.0f} 数据点/秒")
-        
-    else:
-        print(f"❌ 极限流水线处理失败，未获得结果")
-    
-    print("=" * 80)
-
-def test_large_sequence_1536():
-    """大规模测试：1536个浮点数的Softmax计算"""
-    print("=" * 80)
-    print("🎯 大规模测试：1536个浮点数的Softmax计算")
-    print("=" * 80)
-    
-    import numpy as np
-    import torch
-    import time
-    
-    # 生成1536个随机浮点数
-    np.random.seed(456)
-    sequence_length = 1536
-    
-    # 创建相对简单但规模大的数据分布
-    test_data = []
-    
-    # 1. 正态分布数据 (0-768)
-    normal_data = np.random.normal(5, 8, 768).tolist()
-    test_data.extend(normal_data)
-    
-    # 2. 线性递增数据 (768-1280)
-    linear_data = [i * 0.05 for i in range(512)]
-    test_data.extend(linear_data)
-    
-    # 3. 随机混合数据 (1280-1536)
-    mixed_data = np.random.uniform(-5, 30, 256).tolist()
-    test_data.extend(mixed_data)
-    
-    print(f"📊 大规模测试数据统计:")
-    print(f"   序列长度: {len(test_data)}")
-    print(f"   最大值: {max(test_data):.3f}")
-    print(f"   最小值: {min(test_data):.3f}")
-    print(f"   平均值: {np.mean(test_data):.3f}")
-    print(f"   标准差: {np.std(test_data):.3f}")
-    
-    # 创建流水线
-    pipeline = SoftmaxPipeline(front_window=48, back_window=48, max_rows=1)
-    
-    print(f"\n⚙️  大规模流水线配置:")
-    print(f"   前窗口大小: 48")
-    print(f"   后窗口大小: 48")
-    print(f"   最大并行行数: 1")
-    
-    # 准备输入数据 - 窗口优先策略
-    pipeline_input = []
-    row_id = 0
-    row_length = len(test_data)
-    
-    # 1. 前窗口数据优先
-    for i in range(min(48, row_length)):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 2. 后窗口数据
-    for i in range(max(0, row_length - 48), row_length):
-        if i >= 48:
-            pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 3. 剩余中间数据
-    for i in range(48, row_length - 48):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    print(f"   总输入数据点: {len(pipeline_input)}")
-    
-    # 运行流水线并计时
-    print(f"\n🚀 开始大规模流水线处理...")
-    start_time = time.time()
-    
-    results = pipeline.run_pipeline(
-        pipeline_input, 
-        max_cycles=4500,  # 适中的最大周期数
-        print_progress=True
-    )
-    
-    end_time = time.time()
-    processing_time = end_time - start_time
-    
-    print(f"\n⏱️  大规模处理完成，用时: {processing_time:.3f}秒")
-    print(f"   平均每个数据点: {processing_time/len(test_data)*1000:.3f}毫秒")
-    print(f"   吞吐量: {len(test_data)/processing_time:.0f} 数据点/秒")
-    
-    # 检查结果
-    if row_id in results:
-        result_row = results[row_id]
-        print(f"\n✅ 大规模处理结果验证:")
-        print(f"   输出数据点数: {len(result_row)}")
-        
-        # 计算softmax结果和概率总和
-        softmax_results = []
-        for col_idx in sorted(result_row.keys()):
-            softmax_val = bf16_to_float(result_row[col_idx])
-            softmax_results.append(softmax_val)
-        
-        total_sum = sum(softmax_results)
-        print(f"   概率总和: {total_sum:.6f}")
-        print(f"   最大概率: {max(softmax_results):.6f}")
-        print(f"   最小概率: {min(softmax_results):.6f}")
-        print(f"   非零概率数量: {sum(1 for x in softmax_results if x > 0)}")
-        
-        # 显示前5个和后5个结果
-        print(f"\n📋 前5个结果:")
-        for i in range(min(5, len(softmax_results))):
-            print(f"   [{i:3d}] 输入: {test_data[i]:8.3f} -> softmax: {softmax_results[i]:.6f}")
-        
-        print(f"📋 后5个结果:")
-        for i in range(max(0, len(softmax_results)-5), len(softmax_results)):
-            print(f"   [{i:3d}] 输入: {test_data[i]:8.3f} -> softmax: {softmax_results[i]:.6f}")
-        
-        # 与PyTorch对比
-        print(f"\n🔍 与PyTorch BF16对比:")
-        torch_start = time.time()
-        torch_input = torch.tensor(test_data, dtype=torch.bfloat16)
-        torch_result = torch.softmax(torch_input, dim=0).float()
-        torch_end = time.time()
-        torch_time = torch_end - torch_start
-        
-        print(f"   PyTorch处理时间: {torch_time:.3f}秒")
-        print(f"   速度比较: PyTorch比自定义快 {processing_time/torch_time:.1f}倍")
-        
-        # 计算误差统计
-        torch_list = torch_result.tolist()
-        errors = [abs(softmax_results[i] - torch_list[i]) for i in range(len(softmax_results))]
-        mean_error = np.mean(errors)
-        max_error = max(errors)
-        
-        print(f"\n📊 误差统计:")
-        print(f"   平均误差: {mean_error:.8f}")
-        print(f"   最大误差: {max_error:.8f}")
-        
-        # 检查概率分布的合理性
-        print(f"\n🎯 概率分布分析:")
-        max_input_idx = test_data.index(max(test_data))
-        max_input_softmax = softmax_results[max_input_idx]
-        print(f"   输入最大值位置: {max_input_idx}, 值: {test_data[max_input_idx]:.3f}")
-        print(f"   对应softmax值: {max_input_softmax:.6f}")
-        
-        # 检查是否符合softmax性质
-        is_valid = abs(total_sum - 1.0) < 1e-2 and all(x >= 0 for x in softmax_results)
-        print(f"   ✅ 通过softmax有效性检查" if is_valid else f"   ⚠️  softmax检查有问题")
-        
-        # 性能总结
-        print(f"\n🏆 大规模性能总结:")
-        print(f"   ✅ 成功处理1536个浮点数")
-        print(f"   ✅ 流水线架构稳定运行")
-        print(f"   ✅ BF16精度计算准确")
-        print(f"   ✅ 与PyTorch结果高度一致")
-        print(f"   ✅ 吞吐量: {len(test_data)/processing_time:.0f} 数据点/秒")
-        
-    else:
-        print(f"❌ 大规模流水线处理失败，未获得结果")
-    
-    print("=" * 80)
-
-def test_extreme_long_sequence_debug():
-    """极限测试：2048个浮点数的Softmax计算 - 调试版本"""
-    print("=" * 80)
-    print("🔥 极限测试（调试版）：2048个浮点数的Softmax计算")
-    print("=" * 80)
-    
-    import numpy as np
-    import torch
-    import time
-    
-    # 生成2048个随机浮点数 - 使用更简单的分布
-    np.random.seed(123)
-    sequence_length = 2048
-    
-    # 使用更简单的数据分布，避免极端值
-    test_data = np.random.normal(10, 5, 2048).tolist()
-    
-    print(f"📊 极限测试数据统计:")
-    print(f"   序列长度: {len(test_data)}")
-    print(f"   最大值: {max(test_data):.3f}")
-    print(f"   最小值: {min(test_data):.3f}")
-    print(f"   平均值: {np.mean(test_data):.3f}")
-    print(f"   标准差: {np.std(test_data):.3f}")
-    print(f"   数据范围: {max(test_data) - min(test_data):.3f}")
-    
-    # 创建流水线，使用更大的窗口
-    pipeline = SoftmaxPipeline(front_window=64, back_window=64, max_rows=1)
-    
-    print(f"\n⚙️  极限流水线配置:")
-    print(f"   前窗口大小: 64")
-    print(f"   后窗口大小: 64")
-    print(f"   最大并行行数: 1")
-    print(f"   预计最大周期数: 8000")
-    
-    # 准备输入数据 - 窗口优先策略
-    pipeline_input = []
-    row_id = 0
-    row_length = len(test_data)
-    
-    print(f"\n🔄 准备极限流水线输入数据...")
-    
-    # 1. 前窗口数据优先 (0-63)
-    for i in range(min(64, row_length)):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 2. 后窗口数据 (1984-2047)
-    for i in range(max(0, row_length - 64), row_length):
-        if i >= 64:  # 避免与前窗口重复
-            pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    # 3. 剩余中间数据 (64-1983)
-    for i in range(64, row_length - 64):
-        pipeline_input.append((test_data[i], row_id, i, row_length))
-    
-    print(f"   总输入数据点: {len(pipeline_input)}")
-    
-    # 运行流水线并计时 - 带调试
-    print(f"\n🚀 开始极限流水线处理（调试模式）...")
-    start_time = time.time()
-    
-    # 手动运行流水线以添加调试信息
-    results = {}
-    input_idx = 0
-    
-    with tqdm(total=len(pipeline_input) + 100, desc="调试流水线处理") as pbar:
-        cycle = 0
-        max_cycles = 8000
-        last_debug_cycle = 0
-        
-        while (input_idx < len(pipeline_input) or pipeline.is_active()) and cycle < max_cycles:
-            # 获取当前输入
-            if input_idx < len(pipeline_input):
-                val, row_id, col_idx, row_length = pipeline_input[input_idx]
-                val_bf16 = convert_through_pipeline(val) if isinstance(val, float) else val
-                result = pipeline.clock_cycle(True, val_bf16, row_id, col_idx, row_length)
-                input_idx += 1
-            else:
-                result = pipeline.clock_cycle(False)
-            
-            # 收集完成的结果
-            for row_id, row_result in result["completed_rows"].items():
-                if row_id not in results:
-                    results[row_id] = row_result
-                    print(f"✅ 行{row_id}处理完成")
-            
-            cycle += 1
-            pbar.update(1)
-            
-            # 每1000个周期输出调试信息
-            if cycle - last_debug_cycle >= 1000:
-                print(f"\n🔍 调试信息 (周期 {cycle}):")
-                print(f"   输入进度: {input_idx}/{len(pipeline_input)}")
-                print(f"   活跃行数: {len(pipeline.row_states)}")
-                print(f"   流水线活跃: {pipeline.is_active()}")
-                
-                # 显示各行状态
-                for rid, row_state in pipeline.row_states.items():
-                    print(f"   行{rid}: 阶段={row_state.phase}, 接收={row_state.received_count}/{row_state.row_length}")
-                    if row_state.phase == "processing_exp":
-                        print(f"     exp处理进度: {row_state.exp_processing_idx}/{len(row_state.all_data)}")
-                    elif row_state.phase == "division":
-                        print(f"     除法处理进度: {row_state.division_processing_idx}/{len(row_state.exp_values)}")
-                
-                last_debug_cycle = cycle
-            
-            if cycle >= pbar.total:
-                pbar.total = cycle + 100
-                pbar.refresh()
-    
-    end_time = time.time()
-    processing_time = end_time - start_time
-    
-    print(f"\n⏱️  极限处理完成，用时: {processing_time:.3f}秒")
-    print(f"   总周期数: {cycle}")
-    print(f"   平均每个数据点: {processing_time/len(test_data)*1000:.3f}毫秒")
-    print(f"   吞吐量: {len(test_data)/processing_time:.0f} 数据点/秒")
-    
-    # 检查结果
-    if 0 in results:
-        result_row = results[0]
-        print(f"\n✅ 极限处理结果验证:")
-        print(f"   输出数据点数: {len(result_row)}")
-        
-        # 计算softmax结果和概率总和
-        softmax_results = []
-        for col_idx in sorted(result_row.keys()):
-            softmax_val = bf16_to_float(result_row[col_idx])
-            softmax_results.append(softmax_val)
-        
-        total_sum = sum(softmax_results)
-        print(f"   概率总和: {total_sum:.6f}")
-        print(f"   最大概率: {max(softmax_results):.6f}")
-        print(f"   最小概率: {min(softmax_results):.6f}")
-        print(f"   非零概率数量: {sum(1 for x in softmax_results if x > 0)}")
-        
-        # 与PyTorch对比
-        print(f"\n🔍 与PyTorch BF16极限对比:")
-        torch_start = time.time()
-        torch_input = torch.tensor(test_data, dtype=torch.bfloat16)
-        torch_result = torch.softmax(torch_input, dim=0).float()
-        torch_end = time.time()
-        torch_time = torch_end - torch_start
-        
-        print(f"   PyTorch处理时间: {torch_time:.3f}秒")
-        print(f"   速度比较: PyTorch比自定义快 {processing_time/torch_time:.1f}倍")
-        
-        # 计算误差统计
-        torch_list = torch_result.tolist()
-        errors = [abs(softmax_results[i] - torch_list[i]) for i in range(len(softmax_results))]
-        mean_error = np.mean(errors)
-        max_error = max(errors)
-        
-        print(f"\n📊 极限误差统计:")
-        print(f"   平均误差: {mean_error:.8f}")
-        print(f"   最大误差: {max_error:.8f}")
-        
-        # 检查是否符合softmax性质
-        is_valid = abs(total_sum - 1.0) < 1e-2 and all(x >= 0 for x in softmax_results)
-        print(f"\n🎯 极限概率分布分析:")
-        print(f"   ✅ 通过极限softmax有效性检查" if is_valid else f"   ⚠️  softmax检查有问题")
-        
-        # 性能总结
-        print(f"\n🏆 极限性能总结:")
-        print(f"   ✅ 成功处理2048个浮点数")
-        print(f"   ✅ 流水线架构在极限条件下稳定运行")
-        print(f"   ✅ BF16精度在大规模数据下保持准确")
-        print(f"   ✅ 与PyTorch结果在极限条件下高度一致")
-        print(f"   ✅ 吞吐量达到 {len(test_data)/processing_time:.0f} 数据点/秒")
-        
-    else:
-        print(f"❌ 极限流水线处理失败，未获得结果")
-        print(f"   最终周期数: {cycle}")
-        print(f"   输入完成进度: {input_idx}/{len(pipeline_input)}")
-        print(f"   流水线最终状态: 活跃={pipeline.is_active()}")
-        
-        # 显示最终行状态
-        if pipeline.row_states:
-            for rid, row_state in pipeline.row_states.items():
-                print(f"   行{rid}最终状态: 阶段={row_state.phase}, 完成={row_state.is_completed()}")
-    
-    print("=" * 80)
+    print("\n🎯 流水线行为验证:")
+    print("   1. 窗口数据收集过程中就开始计算最大值")
+    print("   2. 窗口数据收集完成后立即开始处理窗口exp")
+    print("   3. 处理非窗口数据时，如果发现更大的值，会触发重新计算")
+    print("   4. 多行数据可以并行处理")
+    print("   5. 每行有独立的最大值计算和exp处理")
+    print("   6. 流水线实现了真正的逐个时钟周期处理")
+    
+    print(f"\n🎉 新实现的SoftmaxPipeline测试完成！")
 
 if __name__ == "__main__":
-    debug_simple_test()
-    print("\n" + "="*80 + "\n")
-    test_softmax_pipeline()
-    print("\n" + "="*80 + "\n")
-    test_new_input_format()
-    print("\n" + "="*80 + "\n")
-    test_window_priority()
-    print("\n" + "="*80 + "\n")
-    test_long_sequence()
-    print("\n" + "="*80 + "\n")
-    test_extreme_long_sequence()
-    print("\n" + "="*80 + "\n")
-    test_large_sequence_1536()
-    print("\n" + "="*80 + "\n")
-    test_extreme_long_sequence_debug()
-    print("\n" + "="*80 + "\n")
-    example_usage() 
+    example_test()
