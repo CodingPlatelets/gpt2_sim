@@ -1,7 +1,7 @@
-from .vector_hadamard_HBM import VectorHadamardSimulatorWithHBM
+from .vector_hadamard_HBM_bf16 import VectorHadamardSimulatorWithHBM
 import torch
 import numpy as np
-
+from .utils import convert_matrix_to_bf16, generate_matrix, fp32_to_bf16
 
 class RowHadamard:
     def __init__(self, PE_num, PE_rows, data_num_per_cycle=256):
@@ -15,12 +15,12 @@ class RowHadamard:
         
     def load_from_hbm(self, vector):
         """加载向量到HBM"""
-        self.hbm_data = vector
+        # 将fp32矩阵转换成bf16
+        vector_bf16 = convert_matrix_to_bf16(vector)
+        # vector_bf16 = np.array([fp32_to_bf16(val) for val in vector.flatten()])
+        self.hbm_data = vector_bf16
     
     def forward(self, X):
-        # 接收float32格式的数据，内部会转为bf16进行计算
-        # 返回结果也是float32格式
-
         # 若输入是 (1, N) 的二维矩阵，转换为一维向量
         if X.ndim == 2 and X.shape[0] == 1:
             X = X.flatten()
@@ -38,24 +38,26 @@ class RowHadamard:
         # 执行Hadamard积
         sim_res = self.simulator.run_simulation(X, self.hbm_data, self.data_num_per_cycle)
 
+        hadamard_out = np.array(sim_res["output_vector"]).reshape(1,-1)
+
         # 可选：验证结果正确性（调试阶段保留）
         self.simulator.verify_result(X, self.hbm_data)
 
-        return sim_res["output_vector"]
+        return hadamard_out
     
 
-def generate_matrix(M, N, sparse_ratio):
-    
-    return np.random.choice([0, 0.01], size=(M, N), p = [sparse_ratio, 1 - sparse_ratio])
 if __name__ == "__main__":
     row_hadamard = RowHadamard(128, 32, 256)
     vector_size = 4096
 
-    # A_vector = np.random.randn(vector_size).astype(np.float32) * 0.1
-    # B_vector = np.random.randn(vector_size).astype(np.float32) * 0.1
+    # 生成测试矩阵
+    A_vector_fp32 = generate_matrix(1, vector_size, 0)
+    B_vector_fp32 = generate_matrix(1, vector_size, 0)
 
-    A_vector = generate_matrix(1,vector_size,0)
-    B_vector = generate_matrix(1,vector_size,0)
-
-    row_hadamard.load_from_hbm(B_vector)
-    result = row_hadamard.forward(A_vector) 
+    # 将矩阵转换为BF16格式
+    A_vector_bf16 = convert_matrix_to_bf16(A_vector_fp32)
+    # 加载B向量到HBM
+    row_hadamard.load_from_hbm(B_vector_fp32)
+    
+    # 执行Hadamard积
+    result = row_hadamard.forward(A_vector_bf16) 
