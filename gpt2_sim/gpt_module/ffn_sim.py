@@ -37,7 +37,7 @@ class FFN:
 
         # ------- 第二层 -------
         d_dim = self._out_dim
-        out2 = self.W2.forward(out1_bf16, out1_bf16.shape[0], h_dim, d_dim, test=True)
+        out2 = self.W2.forward(out1_bf16, out1_bf16.shape[0], h_dim, d_dim, test=False)
         return out2
 
 # ======================= 单元测试 =======================

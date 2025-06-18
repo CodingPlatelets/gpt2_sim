@@ -1,4 +1,4 @@
-from .layernorm_sim import LayerNorm_Sim,LayerNormCoreSW
+from .layernorm_sim import LayerNorm_Sim,LayerNormCoreVerify
 from .residual_sim import Residual_Sim2
 from vector_matrix_module.softmax import Softmax
 from .attention_sim import Attention
@@ -81,10 +81,8 @@ class Block_Sim:
         # 5. FFN
         ffn_out = self.ffn.forward(norm2_out)
         
-        # print(f"hw ffn_out输出示例:\n{ffn_out[0, :10]}")
-        ffn_out_bf16 = convert_matrix_to_bf16(ffn_out)
         # 6. 第二个残差连接
-        final_out = self.res_2.forward(ffn_out_bf16,residual1_out)
+        final_out = self.res_2.forward(ffn_out,residual1_out)
 
         
         return final_out
@@ -120,7 +118,7 @@ class Block_Sim:
         # 将输入转换为FP32进行计算
         x_fp32 = np.vectorize(bf16_to_float)(x_np)
         # 1. 第一个LayerNorm
-        norm1_out = LayerNormCoreSW().forward(x_fp32)
+        norm1_out = LayerNormCoreVerify().forward(x_fp32)
         # 2. Attention
         xw = norm1_out @ wq
         xww = xw @ wk.T
@@ -136,7 +134,7 @@ class Block_Sim:
         # print(f"np res1_out输出示例:\n{residual1_out[0, :10]}")
         
         # 4. 第二个LayerNorm
-        norm2_out = LayerNormCoreSW().forward(residual1_out)
+        norm2_out = LayerNormCoreVerify().forward(residual1_out)
         # 5. FFN
         ffn_out = norm2_out @ w1 @ w2
         ffn_out_bf16 = convert_matrix_to_bf16(ffn_out)
