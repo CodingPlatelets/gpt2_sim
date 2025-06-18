@@ -11,6 +11,7 @@ class Matmul:
         self.data_num_per_cycle = data_num_per_cycle
         self.cycles = 0
         self.hbm_data = {}
+        self.hbm_data_batch = []
         
         self.trapezoid_rows = [TrapezoidPipeline(1, 1, 1, self.PE_num) for _ in range(PE_rows)]
 
@@ -34,16 +35,29 @@ class Matmul:
         return bf16_B_data_list
 
     def load_from_hbm(self, matrix):
-
+        self.is_shared = True
         block_from_hbm = store_csr_in_simple_blocks_fast(csr_matrix(matrix.T), self.data_num_per_cycle)
         self.hbm_data = self._convert_hbm_data_to_bf16(block_from_hbm)
-    
+
+    def load_from_hbm_batch(self, matrix_batch):
+        self.hbm_data_batch = []
+        self.is_shared = False
+        for bx in range(matrix_batch.shape[0]):
+            block_from_hbm = store_csr_in_simple_blocks_fast(csr_matrix(matrix_batch[bx].T), self.data_num_per_cycle)
+            block_from_hbm_bf16 = self._convert_hbm_data_to_bf16(block_from_hbm)
+            self.hbm_data_batch.append(block_from_hbm_bf16)
     # A must to be bf16, B from hbm
-    def forward(self, A, M, K, N, test=False):
+    def forward(self, A, M, K, N ,test=False):
         for trape in self.trapezoid_rows:
             trape.reset(M, K, N)
         main_trap = self.trapezoid_rows[0]
-        result = main_trap.run_pipeline_hbm_multi([A], self.hbm_data, self.trapezoid_rows, -1)
+        is_batch = len(A.shape) == 3
+        if is_batch and self.is_shared:
+            result = main_trap.run_pipeline_hbm_multi_batch_for_weight_fast(A, self.hbm_data, self.trapezoid_rows, -1)
+        elif is_batch and not self.is_shared:
+            result = main_trap.run_pipeline_hbm_multi_batch(A, self.hbm_data_batch, self.trapezoid_rows, -1)
+        else:
+            result = main_trap.run_pipeline_hbm_multi([A], self.hbm_data, self.trapezoid_rows, -1)
         if test:
             return result["combined_c_matrix"]
         return result["combined_c_matrix_bf16"]
