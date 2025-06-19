@@ -1,6 +1,5 @@
 from .matmul_sim import Matmul
-from vector_matrix_module.row_product_module import RowProduct  # 可能后续做 residual 用，这里预留
-from vector_matrix_module.softmax import Softmax  # 备用，未使用
+# from vector_matrix_module.row_product_module import RowProduct
 from bf16_module.utils import convert_through_pipeline
 from .test import generate_matrix
 import numpy as np
@@ -52,7 +51,6 @@ def convert_matrix_to_bf16(A: np.ndarray):
 
 def test_ffn():
     """简单验证 FFN 输出与 NumPy 结果一致"""
-    print("11111111111111111111111111")
     vector_size = 256
     hidden_dim = 4 * vector_size  # 常见 FFN 隐层 = 4 * d_model
 
@@ -65,7 +63,7 @@ def test_ffn():
     ffn.load_weights(W1, W2)
 
     # 生成输入
-    X = generate_matrix(1, vector_size, 0.0)
+    X = generate_matrix(8, vector_size, 0.0)
     X_bf16 = convert_matrix_to_bf16(X)
 
     # 计算
