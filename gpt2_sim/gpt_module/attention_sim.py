@@ -2,6 +2,7 @@ from .matmul_sim import Matmul
 # 使用 software_hw_sim.py 中的硬件模拟版本
 from softmax_module.software_hw_sim import SoftmaxPipeline
 from .test import generate_x_wq_wk_xt, generate_matrix
+from .test_tgx import generate_x_wq_wk_xt_batch
 from vector_matrix_module.row_product_module import RowProduct
 from bf16_module.utils import convert_through_pipeline
 import numpy as np
@@ -171,6 +172,8 @@ def convert_matrix_to_bf16(A):
     return A_bf16
 
 
+
+
 def test():
     vector_size = 1024  # 适中的向量大小用于测试
     attention = Attention(128, 32, 256)
@@ -249,6 +252,65 @@ def test():
         max_error = np.max(np.abs(expected_xwqkx - xwwxt))
         print(f"最大误差: {max_error:.6f}")
 
+def test_batch():
+    vector_size = 256  # 为了演示，batch测试用较小向量
+    batch_size = 4
+    attention = Attention(128, 32, 256)
+
+    # 生成batch测试数据
+    from .test_tgx import generate_x_wq_wk_xt_batch, convert_batch_matrix_to_bf16
+    from vector_matrix_module.softmax import Softmax
+    X, wq, wk, xt = generate_x_wq_wk_xt_batch(past_token_length=63, channel=vector_size, sparse_ratio=0.95, batch=batch_size)
+    past_token_num = xt.shape[1]  # batch, seq, channel
+    wv = np.random.choice([0, 1], size=(batch_size, past_token_num, vector_size), p=[0.9, 0.1])
+
+    # 参考实现（逐batch）
+    expected_xwqkx = []
+    for i in range(batch_size):
+        ref = (Softmax().forward(((X[i] @ wq) @ wk.T) @ xt[i].T)) @ wv[i]
+        expected_xwqkx.append(ref)
+    expected_xwqkx = np.array(expected_xwqkx)
+
+    # 加载权重（假设batch内共享wq/wk/wv/xt结构）
+    attention.Wq.load_from_hbm(wq)
+    attention.Wk.load_from_hbm(wk.T)
+    attention.XT.load_from_hbm_batch(xt)  
+    x_bf16 = convert_batch_matrix_to_bf16(X)
+
+    print("开始运行 Batch Attention 硬件模拟...")
+    import time
+    start_time = time.time()
+    # 这里只能一组一组跑，因为当前Attention实现不支持batch权重
+    x_bf16 = convert_matrix_to_bf16(X)
+
+    
+    # 更新调用方式以接收额外的模拟信息
+    out, xwwxt, softmax_sim_info = attention.forward(x_bf16, past_token_num= past_token_num)
+    
+    total_time = time.time() - start_time
+
+
+    print("=" * 50)
+    print(f"Batch 测试: batch_size={batch_size}, 向量维度={vector_size}, past_token_num={past_token_num}")
+    print(f"总执行时间: {total_time*1000:.2f}ms")
+    print(f"每个batch平均时间: {total_time*1000/batch_size:.2f}ms")
+    print()
+    for i, sim_info in enumerate(softmax_sim_info):
+        print(f"--- Batch {i} ---")
+        print(f"  输入形状: {X[i].shape}")
+        print(f"  softmax输出形状: {out[i].shape}")
+        print(f"  总周期数: {sim_info['total_cycles']}")
+        print(f"  PE效率: {sim_info['pe_efficiency']:.2%}")
+        print(f"  行和: {np.sum(out[i], axis=-1)} (应接近1)")
+        print(f"  行和检查: {np.allclose(np.sum(out[i], axis=-1), 1.0, rtol=1e-2, atol=1e-2)}")
+        print(f"  精度验证: {np.allclose(expected_xwqkx[i], xwwxt[i], rtol=1e-2, atol=1e-2)}")
+        if not np.allclose(expected_xwqkx[i], xwwxt[i], rtol=1e-2, atol=1e-2):
+            print(f"    最大误差: {np.max(np.abs(expected_xwqkx[i] - xwwxt[i])):.6f}")
+            print(f"    期望样本: {expected_xwqkx[i].flatten()[:5]}")
+            print(f"    实际样本: {xwwxt[i].flatten()[:5]}")
+    print("=" * 50)
+
 # 运行测试
 if __name__ == "__main__":
-    test()
+    #test()
+    test_batch()

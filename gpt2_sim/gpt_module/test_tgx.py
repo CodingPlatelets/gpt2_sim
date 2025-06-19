@@ -2,7 +2,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from trapezoid_module.trapezoid_sim import TrapezoidPipeline
 from hbm import store_csr_in_simple_blocks_fast
-from bf16_module.utils import convert_through_pipeline, bf16_to_float
+from trapezoid_module.utils import convert_through_pipeline, bf16_to_float
 from .matmul_sim import Matmul
 
 

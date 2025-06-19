@@ -40,3 +40,25 @@ def softmax(x: np.ndarray) -> np.ndarray:
     
     else:
         raise ValueError("输入维度必须为1或2")
+
+def test_batch_softmax():
+    print("=== Softmax 多batch测试 ===")
+    s = Softmax()
+    # 1D输入
+    x1 = np.array([1.0, 2.0, 3.0])
+    print("1D输入:", s.forward(x1))
+    print("sum:", np.sum(s.forward(x1)))
+    # 2D输入（batch）
+    x2 = np.array([[1.0, 2.0, 3.0], [0.1, 0.2, 0.3]])
+    print("2D batch输入:", s.forward(x2))
+    print("sum(axis=1):", np.sum(s.forward(x2), axis=1))
+    # 3D输入（应报错）
+    x3 = np.random.rand(2,3,4)
+    try:
+        s.forward(x3)
+    except ValueError as e:
+        print("3D输入报错:", e)
+    print("=== Softmax 多batch测试结束 ===")
+
+if __name__ == "__main__":
+    test_batch_softmax()
