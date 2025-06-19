@@ -4,6 +4,7 @@ from softmax_module.software_hw_sim import SoftmaxPipeline
 from .test import generate_x_wq_wk_xt, generate_matrix
 from .test_tgx import generate_x_wq_wk_xt_batch
 from vector_matrix_module.row_product_module import RowProduct
+from vector_matrix_module.row_product_multibatch_module import RowProduct as RowProductMultiBatch
 from bf16_module.utils import convert_through_pipeline
 import numpy as np
 
@@ -20,6 +21,7 @@ class Attention:
         self.Wk = Matmul(PE_num, PE_rows, data_num_per_cycle)
         self.XT = Matmul(PE_num, PE_rows, data_num_per_cycle)
         self.Wv = RowProduct(PE_num, PE_rows, data_num_per_cycle)
+        self.Wv_multi_batch = RowProductMultiBatch(PE_num, PE_rows, data_num_per_cycle)
 
         # 使用 software_hw_sim.py 中的 SoftmaxPipeline
         # 窗口大小可以根据 PE 配置自适应调整
@@ -39,22 +41,30 @@ class Attention:
     def forward(self, x, past_token_num):
         # 对于 Wq、Wk 来说，它们都是 (K, K) 的方阵，其列数应与输入向量的维度 K 相同。
 
-        k_dim = x.shape[1]  # 输入向量的维度 K
+        if x.ndim == 3:
+            k_dim = x.shape[2]
+            M = x.shape[1]
+        else:
+            k_dim = x.shape[1]
+            M = x.shape[0]
 
         # 1) X @ Wq
-        xw = self.Wq.forward(x, x.shape[0], k_dim, k_dim, test=False)
+        
+        xw = self.Wq.forward(x, M, k_dim, k_dim, test=False)
 
         # 2) (XWq) @ Wk^T
-        xww = self.Wk.forward(xw, xw.shape[0], k_dim, k_dim, test=False)
+        xww = self.Wk.forward(xw, M, k_dim, k_dim, test=False)
 
         # 3) ((XWq)Wk^T) @ XT^T
-        xwwx = self.XT.forward(xww, xww.shape[0], k_dim, past_token_num, test=True)
+        xwwx = self.XT.forward(xww, M, k_dim, past_token_num, test=True)
 
         # 4) softmax - 使用硬件流水线模拟版本
         softmax_out, softmax_sim_info = self._run_softmax_pipeline(xwwx)
 
-        # 5) (softmax) @ Wv
-        xwwxt = self.Wv.forward(softmax_out)
+        if x.ndim == 3:
+            xwwxt = self.Wv_multi_batch.forward(softmax_out)
+        else:
+            xwwxt = self.Wv.forward(softmax_out)
          
         # 累计周期数（包含 softmax 的周期）
         self.cycles += softmax_sim_info.get('total_cycles', 0)
@@ -68,7 +78,7 @@ class Attention:
         运行 softmax 硬件流水线模拟
         
         Args:
-            input_matrix: 输入矩阵 (batch_size, seq_len)
+            input_matrix: 输入矩阵 (batch_size, seq_len) 或 (batch_size, 1, seq_len)
             
         Returns:
             tuple: (softmax_output, simulation_info)
@@ -79,7 +89,10 @@ class Attention:
         # 确保输入是二维的
         if input_matrix.ndim == 1:
             input_matrix = input_matrix.reshape(1, -1)
-        
+        # 新增：支持 (batch, 1, length) 自动 squeeze
+        if input_matrix.ndim == 3 and input_matrix.shape[1] == 1:
+            input_matrix = input_matrix.squeeze(1)
+
         batch_size, seq_len = input_matrix.shape
         
         # 准备流水线输入数据: (val, row_id, col_idx, row_length)
@@ -116,6 +129,7 @@ class Attention:
         
         # 重构输出矩阵
         output_matrix = np.zeros_like(input_matrix)
+
         for row_id in range(batch_size):
             if row_id in results:
                 row_results = results[row_id]
@@ -262,28 +276,33 @@ def test_batch():
     from vector_matrix_module.softmax import Softmax
     X, wq, wk, xt = generate_x_wq_wk_xt_batch(past_token_length=63, channel=vector_size, sparse_ratio=0.95, batch=batch_size)
     past_token_num = xt.shape[1]  # batch, seq, channel
-    wv = np.random.choice([0, 1], size=(batch_size, past_token_num, vector_size), p=[0.9, 0.1])
+    wv = generate_matrix(past_token_num , vector_size, 0.9)
 
-    # 参考实现（逐batch）
+    print("xt.shape", xt.shape)
+
+    # 计算 batch 版 numpy 参考结果
     expected_xwqkx = []
+    softmax = Softmax()
     for i in range(batch_size):
-        ref = (Softmax().forward(((X[i] @ wq) @ wk.T) @ xt[i].T)) @ wv[i]
+        xwq = X[i] @ wq
+        xwqwk = xwq @ wk.T
+        xwqwkxt = xwqwk @ xt[i].T
+        softmax_out = softmax.forward(xwqwkxt)
+        ref = softmax_out @ wv
         expected_xwqkx.append(ref)
     expected_xwqkx = np.array(expected_xwqkx)
 
-    # 加载权重（假设batch内共享wq/wk/wv/xt结构）
     attention.Wq.load_from_hbm(wq)
     attention.Wk.load_from_hbm(wk.T)
-    attention.XT.load_from_hbm_batch(xt)  
+    attention.XT.load_from_hbm_batch(xt.transpose(0, 2, 1))  
+    attention.Wv_multi_batch.load_from_hbm(wv)
     x_bf16 = convert_batch_matrix_to_bf16(X)
+
 
     print("开始运行 Batch Attention 硬件模拟...")
     import time
     start_time = time.time()
-    # 这里只能一组一组跑，因为当前Attention实现不支持batch权重
-    x_bf16 = convert_matrix_to_bf16(X)
 
-    
     # 更新调用方式以接收额外的模拟信息
     out, xwwxt, softmax_sim_info = attention.forward(x_bf16, past_token_num= past_token_num)
     
@@ -291,24 +310,51 @@ def test_batch():
 
 
     print("=" * 50)
-    print(f"Batch 测试: batch_size={batch_size}, 向量维度={vector_size}, past_token_num={past_token_num}")
-    print(f"总执行时间: {total_time*1000:.2f}ms")
-    print(f"每个batch平均时间: {total_time*1000/batch_size:.2f}ms")
+    print("=== Softmax 硬件流水线模拟信息 ===")
+    print(f"输入矩阵形状: {X.shape} -> softmax输入: {out.shape}")
+    print(f"序列长度: {softmax_sim_info['seq_len']}")
+    print(f"批次大小: {softmax_sim_info['batch_size']}")
+    print(f"总处理元素: {softmax_sim_info['total_elements']}")
     print()
-    for i, sim_info in enumerate(softmax_sim_info):
-        print(f"--- Batch {i} ---")
-        print(f"  输入形状: {X[i].shape}")
-        print(f"  softmax输出形状: {out[i].shape}")
-        print(f"  总周期数: {sim_info['total_cycles']}")
-        print(f"  PE效率: {sim_info['pe_efficiency']:.2%}")
-        print(f"  行和: {np.sum(out[i], axis=-1)} (应接近1)")
-        print(f"  行和检查: {np.allclose(np.sum(out[i], axis=-1), 1.0, rtol=1e-2, atol=1e-2)}")
-        print(f"  精度验证: {np.allclose(expected_xwqkx[i], xwwxt[i], rtol=1e-2, atol=1e-2)}")
-        if not np.allclose(expected_xwqkx[i], xwwxt[i], rtol=1e-2, atol=1e-2):
-            print(f"    最大误差: {np.max(np.abs(expected_xwqkx[i] - xwwxt[i])):.6f}")
-            print(f"    期望样本: {expected_xwqkx[i].flatten()[:5]}")
-            print(f"    实际样本: {xwwxt[i].flatten()[:5]}")
+    print(f"=== 流水线配置 ===")
+    print(f"前窗口大小: {softmax_sim_info['front_window']}")
+    print(f"后窗口大小: {softmax_sim_info['back_window']}")
+    print(f"最大并行行数: {softmax_sim_info['max_rows']}")
+    print(f"流水线输入数据点: {softmax_sim_info['pipeline_input_count']}")
+    print()
+    print(f"=== 性能指标 ===")
+    print(f"总周期数: {softmax_sim_info['total_cycles']}")
+    print(f"PE 利用效率: {softmax_sim_info['pe_efficiency']:.2%}")
+    print(f"模拟执行时间: {softmax_sim_info['execution_time']*1000:.2f}ms")
+    print(f"总执行时间: {total_time*1000:.2f}ms")
+    print()
+    print(f"=== 周期分解 ===")
+    for stage, cycles in softmax_sim_info['cycles_breakdown'].items():
+        percentage = cycles / softmax_sim_info['total_cycles'] * 100 if softmax_sim_info['total_cycles'] > 0 else 0
+        print(f"{stage}: {cycles} 周期 ({percentage:.1f}%)")
+    print()
+    print(f"=== 整体 Attention 性能 ===")
+    print(f"Attention 总周期数: {attention.cycles}")
     print("=" * 50)
+    
+    # 验证 softmax 输出的性质
+    print(f"\n=== Softmax 输出验证 ===")
+    row_sums = np.sum(out, axis=-1)
+    print(f"Softmax 行和: {row_sums} (应该接近1)")
+    print(f"行和检查通过: {np.allclose(row_sums, 1.0, rtol=1e-2, atol=1e-2)}")
+    
+    # 准确性验证
+    print(f"\n=== 准确性验证 ===")
+    if np.allclose(expected_xwqkx, xwwxt, rtol=1e-2, atol=1e-2) :
+        print("✓ Attention 整体结果验证通过!")
+        max_error = np.max(np.abs(expected_xwqkx - xwwxt))
+        print(f"最大误差: {max_error:.6f}")
+    else:
+        print("✗ Attention 整体结果验证失败!")
+        print("期望结果样本:", expected_xwqkx.flatten()[:5])
+        print("实际结果样本:", xwwxt.flatten()[:5])
+        max_error = np.max(np.abs(expected_xwqkx - xwwxt))
+        print(f"最大误差: {max_error:.6f}")
 
 # 运行测试
 if __name__ == "__main__":

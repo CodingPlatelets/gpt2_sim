@@ -203,7 +203,7 @@ def test_batch_no_shared():
         print(expected_xwq - xwq)
 
 
-test_batch_no_shared()
+#test_batch_no_shared()
 
     
 

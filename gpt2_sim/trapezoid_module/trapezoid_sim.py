@@ -477,7 +477,7 @@ class TrapezoidPipeline:
             for mac in state["components"]["mac_units"]
             if mac["valid"] or mac["pipeline_active"]
         )
-        print(f"乘法单元: {active_macs}/{len(state["components"]["mac_units"])} 活跃")
+        print(f"乘法单元: {active_macs}/{len(state['components']['mac_units'])} 活跃")
 
         # MFIU状态
         mfiu_active = any(
@@ -1208,7 +1208,7 @@ class TrapezoidPipeline:
         # 构建最终的输出矩阵，shape为(batch, M, N)
         M, N = trapezoid_list[0].M, trapezoid_list[0].N
         combined_c_matrix = np.zeros((batch, M, N))
-        combined_c_matrix_bf16 = np.zeros((batch, M, N), dtype=object)
+        combined_c_matrix_bf16 = np.zeros((batch, M, N))
 
         batch_results = {}
         for batch_idx in range(batch):
@@ -1252,7 +1252,7 @@ class TrapezoidPipeline:
         batch = A_matrices_batch.shape[0]
 
         combined_c_matrix = np.zeros((batch, M, N))
-        combined_c_matrix_bf16 = np.zeros((batch, M, N), dtype=object)
+        combined_c_matrix_bf16 = np.zeros((batch, M, N))
 
         estimated_cycles = len(B_data_list_batch[0]) + 20
         print(f"🚀 开始多Trapezoid HBM处理: {num_trapezoids}个流水线")
