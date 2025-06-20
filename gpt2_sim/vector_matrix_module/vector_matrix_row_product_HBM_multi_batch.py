@@ -329,7 +329,7 @@ class VectorMatrixRowProductSimulatorWithHBM:
             A_vectors = A_vectors.reshape(1, -1)
         
         batch_size, vector_dim = A_vectors.shape
-        logger.info(f"开始HBM模式多batch模拟. A({batch_size}, {vector_dim}) @ B({B_matrix_sparse.shape})")
+        logger.info(f"行积：开始HBM模式多batch模拟. A({batch_size}, {vector_dim}) @ B({B_matrix_sparse.shape})")
         
         # 计算perows分组策略
         perows_per_batch = self.num_perows // batch_size
@@ -357,7 +357,7 @@ class VectorMatrixRowProductSimulatorWithHBM:
         total_tasks_generated = 0
         cycle = 0
         num_blocks = len(B_blocks)
-        pbar = tqdm(total=num_blocks+100, desc="处理HBM多batch数据", unit="cycle")
+        pbar = tqdm(total=num_blocks+100, desc="行积：处理HBM多batch数据", unit="cycle")
         
         while block_idx < num_blocks or any(perow.is_busy() for perow in self.perows):
             # 注入新的block数据

@@ -1,7 +1,6 @@
 from .matmul_sim import Matmul
-# from vector_matrix_module.row_product_module import RowProduct
 from bf16_module.utils import convert_through_pipeline
-from .test import generate_matrix
+from .test_tgx import generate_matrix , generate_matrix_batch
 import numpy as np
 
 class FFN:
@@ -30,23 +29,37 @@ class FFN:
     def forward(self, x_bf16: np.ndarray):
         """x_bf16 应为 bf16 格式 (1, K)。返回 float32 结果矩阵 (1, D)。"""
         # ------- 第一层 -------
+        if x_bf16.ndim == 3:
+            k_dim = x_bf16.shape[2]
+            M = x_bf16.shape[1]
+        else:
+            k_dim = x_bf16.shape[1]
+            M = x_bf16.shape[0]
+        
         k_dim = x_bf16.shape[1]
         h_dim = self._hidden_dim
-        out1_bf16 = self.W1.forward(x_bf16, x_bf16.shape[0], k_dim, h_dim, test=False)
+        out1_bf16 = self.W1.forward(x_bf16, M, k_dim, h_dim, test=False)
 
         # ------- 第二层 -------
         d_dim = self._out_dim
-        out2 = self.W2.forward(out1_bf16, out1_bf16.shape[0], h_dim, d_dim, test=False)
+        out2 = self.W2.forward(out1_bf16, M, h_dim, d_dim, test=False)
         return out2
 
 # ======================= 单元测试 =======================
 
 def convert_matrix_to_bf16(A: np.ndarray):
     A_bf16 = np.zeros_like(A)
-    for i in range(A.shape[0]):
-        for j in range(A.shape[1]):
-            if A[i, j] != 0:
-                A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
+    if A.ndim == 3:
+        for i in range(A.shape[0]):
+            for j in range(A.shape[1]):
+                for k in range(A.shape[2]):
+                    if A[i, j, k] != 0:
+                        A_bf16[i, j, k] = convert_through_pipeline(float(A[i, j, k]))
+    else:
+        for i in range(A.shape[0]):
+            for j in range(A.shape[1]):
+                if A[i, j] != 0:
+                    A_bf16[i, j] = convert_through_pipeline(float(A[i, j]))
     return A_bf16
 
 def test_ffn():
@@ -63,11 +76,12 @@ def test_ffn():
     ffn.load_weights(W1, W2)
 
     # 生成输入
-    X = generate_matrix(8, vector_size, 0.0)
-    X_bf16 = convert_matrix_to_bf16(X)
+    # X = generate_matrix(1, vector_size, 0.0)
+    X = generate_matrix_batch(8,  vector_size, 0)
+    # X_bf16 = convert_matrix_to_bf16(X)
 
     # 计算
-    out_sim = ffn.forward(X_bf16)
+    out_sim = ffn.forward(X)
     out_np = X @ W1 @ W2
 
     if np.allclose(out_np, out_sim, rtol=1e-2, atol=1e-2):
