@@ -29,6 +29,9 @@ class FFN:
     def forward(self, x_bf16: np.ndarray):
         """x_bf16 应为 bf16 格式 (1, K)。返回 float32 结果矩阵 (1, D)。"""
         # ------- 第一层 -------
+        if x_bf16.ndim == 1:
+            x_bf16 = x_bf16.reshape(1, -1)
+            
         if x_bf16.ndim == 3:
             k_dim = x_bf16.shape[2]
             M = x_bf16.shape[1]
@@ -36,7 +39,7 @@ class FFN:
             k_dim = x_bf16.shape[1]
             M = x_bf16.shape[0]
         
-        k_dim = x_bf16.shape[1]
+        # k_dim = x_bf16.shape[1]
         h_dim = self._hidden_dim
         out1_bf16 = self.W1.forward(x_bf16, M, k_dim, h_dim, test=False)
 
@@ -69,16 +72,14 @@ def test_ffn():
 
     ffn = FFN(128, 32, 256)
 
-    # 生成稠密权重
-    W1 = generate_matrix(vector_size, hidden_dim, 0.95)  # 全稠密
+    # 生成权重
+    W1 = generate_matrix(vector_size, hidden_dim, 0.95)  
     W2 = generate_matrix(hidden_dim, vector_size, 0.95)
 
     ffn.load_weights(W1, W2)
 
     # 生成输入
-    # X = generate_matrix(1, vector_size, 0.0)
-    X = generate_matrix_batch(8,  vector_size, 0)
-    # X_bf16 = convert_matrix_to_bf16(X)
+    X = generate_matrix_batch(16, 1, vector_size, 0)
 
     # 计算
     out_sim = ffn.forward(X)

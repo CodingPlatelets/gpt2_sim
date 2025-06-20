@@ -23,7 +23,10 @@ class AttnFFNSim:
 
     def forward(self, x_bf16, past_token_num):
         # Attention
-        attn_out, _ = self.attn.forward(x_bf16, past_token_num)
+        _, attn_out, _ = self.attn.forward(x_bf16, past_token_num)
+
+        print(f"attn_out.shape: {attn_out.shape}"
+        )
         # 转 bf16 供 FFN
         attn_out_bf16 = convert_matrix_to_bf16(attn_out)
         # FFN
@@ -33,16 +36,16 @@ class AttnFFNSim:
 # =================== 测试 ===================
 
 def test_attn_ffn():
-    vec_dim = 256
-    hidden_dim = 4 * vec_dim
+    vector_size = 256
+    hidden_dim = 4 * vector_size
     past_len = 300  # past token 已有 255，函数内部会生成 xt 行 = past_len+1
 
     # 生成数据
-    X, wq, wk, xt = generate_x_wq_wk_xt(past_len, vec_dim, 0.95)
+    X, wq, wk, xt = generate_x_wq_wk_xt(past_token_length=127, channel=vector_size, sparse_ratio=0.95) 
     wv_rows = xt.shape[0]  # = past_len + 1，与 Attention 中使用的 past_token_num 对齐
-    wv = generate_matrix(wv_rows, vec_dim, 0.95)
-    W1 = generate_matrix(vec_dim, hidden_dim, 0.95)
-    W2 = generate_matrix(hidden_dim, vec_dim, 0.95)
+    wv = generate_matrix(wv_rows, vector_size, 0.95)
+    W1 = generate_matrix(vector_size, hidden_dim, 0.95)
+    W2 = generate_matrix(hidden_dim, vector_size, 0.95)
 
     # NumPy 参考
     attn_scores = Softmax().forward(((X @ wq) @ wk.T) @ xt.T)  # (1, wv_rows)
