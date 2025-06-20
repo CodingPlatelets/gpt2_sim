@@ -1,10 +1,9 @@
 import torch
 import numpy as np
 import struct
-from vector_matrix_module.row_add_module import RowAdd,RowAdd2
-from vector_matrix_module.row_hadamard_module import RowHadamard
+from vector_matrix_module.row_add_multibatch_module import RowAddMultiBatch, RowAdd2MultiBatch
 from bf16_module.utils import convert_through_pipeline
-from vector_matrix_module.utils import convert_matrix_to_bf16,generate_matrix
+from vector_matrix_module.utils import convert_matrix_to_bf16, generate_matrix
 
 def bf16_to_float(bf16):
     """将BF16值转换为FP32格式的浮点数"""
@@ -24,7 +23,7 @@ class Residual_Sim:
             data_num_per_cycle: 每个周期处理的数据量
         """
         # 初始化各个硬件模拟器
-        self.row_add_res = RowAdd(PE_num, PE_rows, data_num_per_cycle)
+        self.row_add_res = RowAddMultiBatch(PE_num, PE_rows, data_num_per_cycle)
     
     def load_residual(self, residual):
         self.row_add_res.load_from_hbm(residual)
@@ -83,8 +82,8 @@ class Residual_Sim:
             # print(f"硬件模拟输出示例:\n{hw_out[0, :10]}")
         else:
             print("❌ 验证失败: 硬件模拟结果与NumPy实现不匹配")
-            print(f"NumPy输出示例:\n{np_out_fp32[0, :10]}")
-            print(f"硬件模拟输出示例:\n{hw_out[0, :10]}")
+            print(f"NumPy输出示例:\n{np_out_fp32[:3, :10]}")
+            print(f"硬件模拟输出示例:\n{hw_out[:3, :10]}")
         
         return is_correct
 
@@ -99,7 +98,7 @@ class Residual_Sim2:
             data_num_per_cycle: 每个周期处理的数据量
         """
         # 初始化各个硬件模拟器
-        self.row_add_res = RowAdd2(PE_num, PE_rows, data_num_per_cycle)
+        self.row_add_res = RowAdd2MultiBatch(PE_num, PE_rows, data_num_per_cycle)
         
     def forward(self, x_bf16,residual_bf16):
         """
@@ -156,8 +155,8 @@ class Residual_Sim2:
             # print(f"硬件模拟输出示例:\n{hw_out[0, :10]}")
         else:
             print("❌ 验证失败: 硬件模拟结果与NumPy实现不匹配")
-            print(f"NumPy输出示例:\n{np_out_fp32[0, :10]}")
-            print(f"硬件模拟输出示例:\n{hw_out[0, :10]}")
+            print(f"NumPy输出示例:\n{np_out_fp32[:3, :10]}")
+            print(f"硬件模拟输出示例:\n{hw_out[:3, :10]}")
         
         return is_correct
 
@@ -168,25 +167,29 @@ if __name__ == "__main__":
     PE_num = 128
     PE_rows = 32
     data_num_per_cycle = 256
-
-    # 生成测试数据
-    residual = generate_matrix(1, vector_size, 0)
-    x = generate_matrix(1, vector_size, 0)
-
-    x_bf16 = convert_matrix_to_bf16(x)
-    residual_bf16 = convert_matrix_to_bf16(residual)
-    # 创建add模拟器
-    add_sim2 = Residual_Sim2(
-        PE_num=PE_num,
-        PE_rows=PE_rows,
-        data_num_per_cycle=data_num_per_cycle
-    )
-    add_sim = Residual_Sim(
-        PE_num=PE_num,
-        PE_rows=PE_rows,
-        data_num_per_cycle=data_num_per_cycle
-    )
-
-    # add_sim2.verify_result(x_bf16,residual_bf16)
-
-    add_sim.verify_result(x_bf16,residual)
+    np.random.seed(42)
+    # 单batch测试
+    print("\n===== 单batch测试 =====")
+    # residual = generate_matrix(1, vector_size, 0)
+    # x = generate_matrix(1, vector_size, 0)
+    # x_bf16 = convert_matrix_to_bf16(x)
+    # residual_bf16 = convert_matrix_to_bf16(residual)
+    # add_sim = Residual_Sim(PE_num, PE_rows, data_num_per_cycle)
+    # add_sim2 = Residual_Sim2(PE_num, PE_rows, data_num_per_cycle)
+    # print("Residual_Sim:")
+    # add_sim.verify_result(x_bf16, residual)
+    # print("Residual_Sim2:")
+    # add_sim2.verify_result(x_bf16, residual_bf16)
+    # 多batch测试
+    for batch_size in [4, 8, 16, 32]:
+        print(f"\n===== 多batch测试 batch_size={batch_size} =====")
+        x_multi = generate_matrix(batch_size, vector_size, 0)
+        residual_multi = generate_matrix(batch_size, vector_size, 0)
+        x_multi_bf16 = convert_matrix_to_bf16(x_multi)
+        residual_multi_bf16 = convert_matrix_to_bf16(residual_multi)
+        add_sim = Residual_Sim(PE_num, PE_rows, data_num_per_cycle)
+        add_sim2 = Residual_Sim2(PE_num, PE_rows, data_num_per_cycle)
+        print("Residual_Sim:")
+        add_sim.verify_result(x_multi_bf16, residual_multi)
+        print("Residual_Sim2:")
+        add_sim2.verify_result(x_multi_bf16, residual_multi_bf16)

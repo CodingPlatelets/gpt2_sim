@@ -9,7 +9,7 @@ def generate_matrix(M, N, sparse_ratio):
     return np.random.choice([0, 0.1], size=(M, N), p = [sparse_ratio, 1 - sparse_ratio])
 
 def convert_matrix_to_bf16(A):
-    A_bf16 = np.zeros_like(A,dtype=np.int32)
+    A_bf16 = np.zeros_like(A,dtype=np.uint16)
     if A.ndim == 1:
         for i in range(A.shape[0]):
             A_bf16[i] = convert_through_pipeline(float(A[i]))

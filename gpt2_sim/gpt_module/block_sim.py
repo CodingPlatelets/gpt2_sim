@@ -66,7 +66,7 @@ class Block_Sim:
         norm1_out_bf16 = self.ln_1.forward(x_bf16)
         
         # 2. Attention
-        attn_out, _ = self.attn.forward(norm1_out_bf16, past_token_num)
+        _, attn_out, _ = self.attn.forward(norm1_out_bf16, past_token_num)
         # print(f"hw attn_out输出示例:\n{attn_out[0, :10]}")
         # 转 bf16 供 FFN
         attn_out_bf16 = convert_matrix_to_bf16(attn_out)

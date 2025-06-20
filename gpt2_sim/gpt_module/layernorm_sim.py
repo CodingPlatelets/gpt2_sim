@@ -1,8 +1,8 @@
 import torch
 import numpy as np
 import struct
-from vector_matrix_module.row_add_module import RowAdd,RowAdd2
-from vector_matrix_module.row_hadamard_module import RowHadamard
+from vector_matrix_module.row_add_multibatch_module import RowAddMultiBatch
+from vector_matrix_module.row_hadamard_multibatch_module import RowHadamardMultiBatch
 from bf16_module.utils import convert_through_pipeline
 from vector_matrix_module.utils import convert_matrix_to_bf16,generate_matrix,bf16_to_float
 
@@ -208,8 +208,8 @@ class LayerNorm_Sim:
             data_num_per_cycle: 每个周期处理的数据量
         """
         # 初始化各个硬件模拟器
-        self.row_hadamard = RowHadamard(PE_num, PE_rows, data_num_per_cycle)
-        self.row_add_bais = RowAdd(PE_num, PE_rows, data_num_per_cycle)
+        self.row_hadamard = RowHadamardMultiBatch(PE_num, PE_rows, data_num_per_cycle)
+        self.row_add_bais = RowAddMultiBatch(PE_num, PE_rows, data_num_per_cycle)
         # self.norm_core = LayerNormCoreSW()
         self.norm_core = LayerNormCoreHW()
         
@@ -234,6 +234,7 @@ class LayerNorm_Sim:
         
         # 2. 应用权重（Hadamard积）
         weighted_out = self.row_hadamard.forward(norm_out)
+        print(f"结果矩阵样本:\n{weighted_out[:3, :10]}")
         
         # 3. 应用偏置（加法）
         final_out = self.row_add_bais.forward(weighted_out)
@@ -254,18 +255,18 @@ class LayerNorm_Sim:
             bool: 结果是否匹配
         """
         # 转换为NumPy数组
-        x_bf16_np = x_bf16 if isinstance(x_bf16, np.ndarray) else np.array(x_bf16)
-        weight_np = weight if isinstance(weight, np.ndarray) else np.array(weight)
-        bias_np = bias if isinstance(bias, np.ndarray) else np.array(bias)
+        # x_bf16_np = x_bf16 if isinstance(x_bf16, np.ndarray) else np.array(x_bf16)
+        # weight_np = weight if isinstance(weight, np.ndarray) else np.array(weight)
+        # bias_np = bias if isinstance(bias, np.ndarray) else np.array(bias)
         
         # 将输入转换为FP32进行计算
-        x_np_fp32 = np.vectorize(bf16_to_float)(x_bf16_np)
+        x_fp32 = np.vectorize(bf16_to_float)(x_bf16)
         
         # NumPy实现（FP32计算）
         # 1. LayerNorm
-        norm_out = LayerNormCoreVerify().forward(x_np_fp32)
+        norm_out = LayerNormCoreVerify().forward(x_fp32)
         # 2. 应用权重和偏置
-        np_out_fp32 = weight_np * norm_out + bias_np
+        np_out_fp32 = weight * norm_out + bias
 
         # 硬件模拟结果
         self.load_ln_weights(weight,bias)
@@ -279,12 +280,12 @@ class LayerNorm_Sim:
         is_correct = np.allclose(hw_out, np_out_fp32, rtol=1e-2, atol=1e-2)
         if is_correct:
             print("✅ 验证成功: 硬件模拟结果与NumPy实现匹配")
-            print(f"NumPy输出示例:\n{np_out_fp32[0, :10]}")
-            print(f"硬件模拟输出示例:\n{hw_out[0, :10]}")
+            print(f"NumPy输出示例:\n{np_out_fp32[:3, :10]}")
+            print(f"硬件模拟输出示例:\n{hw_out[:3, :10]}")
         else:
             print("❌ 验证失败: 硬件模拟结果与NumPy实现不匹配")
-            print(f"NumPy输出示例:\n{np_out_fp32[0, :10]}")
-            print(f"硬件模拟输出示例:\n{hw_out[0, :10]}")
+            print(f"NumPy输出示例:\n{np_out_fp32[:3, :10]}")
+            print(f"硬件模拟输出示例:\n{hw_out[:3, :10]}")
         
         return is_correct
 
@@ -330,22 +331,18 @@ if __name__ == "__main__":
     PE_rows = 32
     data_num_per_cycle = 256
 
-    # 生成测试数据
-    weight = generate_matrix(1, vector_size, 0)
-    bias = generate_matrix(1, vector_size, 0)
-    residual = generate_matrix(1, vector_size, 0)
-    x = generate_matrix(1, vector_size, 0.5)
-
-    x_bf16 = convert_matrix_to_bf16(x)
-
-    # 创建layernorm模拟器
-    norm_sim = LayerNorm_Sim(
-        PE_num=PE_num,
-        PE_rows=PE_rows,
-        data_num_per_cycle=data_num_per_cycle
-    )
-
-
-    norm_sim.verify_result(x_bf16,weight,bias)
+    # 多batch测试
+    for batch_size in [4, 8, 16, 32]:
+        print(f"\n===== 多batch LayerNorm 测试 batch_size={batch_size} =====")
+        weight = generate_matrix(batch_size, vector_size, 0)
+        bias = generate_matrix(batch_size, vector_size, 0)
+        x = generate_matrix(batch_size, vector_size, 0.5)
+        x_bf16 = convert_matrix_to_bf16(x)
+        norm_sim = LayerNorm_Sim(
+            PE_num=PE_num,
+            PE_rows=PE_rows,
+            data_num_per_cycle=data_num_per_cycle
+        )
+        norm_sim.verify_result(x_bf16, weight, bias)
 
     # test_layerNormCoreHW()
