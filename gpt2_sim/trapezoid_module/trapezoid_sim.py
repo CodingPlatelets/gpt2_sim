@@ -1068,19 +1068,18 @@ class TrapezoidPipeline:
         if batch & (batch - 1) != 0 or batch == 0:
             raise ValueError("batch 必须是2的幂次方！")
 
-        # 验证 batch <= pe_row 并且 pe_row % batch == 0
+        round_num = 1
+      
         pe_row = num_trapezoids
         if batch > pe_row:
-            raise ValueError(f"batch ({batch}) 必须小于等于 pe_row ({pe_row})")
-        if pe_row % batch != 0:
-            raise ValueError(f"pe_row ({pe_row}) 必须能被 batch ({batch}) 整除")
+            round_num = batch // pe_row
 
         # 计算每个batch分配的PE行数
         pe_row_per_batch = pe_row // batch
+        if batch == 64 or batch == 128:
+            pe_row_per_batch = 1
         
 
-        # 初始化结果列表
-        all_results = []
         
         # 为每个batch创建独立的结果累加器
         batch_c_values = {}
@@ -1089,7 +1088,7 @@ class TrapezoidPipeline:
             batch_c_values[batch_idx] = [0] * trapezoid_list[0].M * trapezoid_list[0].N
 
         # 创建输入队列索引，采用轮询方式
-        input_idx = 0
+        
 
         # 估算总周期数：输入数据 + 流水线深度的缓冲
         estimated_cycles = len(B_data_list) + 20  # 20是估算的流水线深度
@@ -1098,119 +1097,105 @@ class TrapezoidPipeline:
         print(f"   {num_trapezoids}个流水线, {batch}个batch, 每batch分配{pe_row_per_batch}个PE")
         
         # 创建进度条
-        with tqdm(total=estimated_cycles, desc="批量权重共享HBM处理", unit="cycle") as pbar:
-            # 运行流水线，直到处理完所有输入并且没有更多有效数据
-            cycle = 0
-            while (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)) and (cycle < max_cycles or max_cycles == -1):
+        cycle = 0
+        for round_idx in range(round_num):
+            input_idx = 0
+            with tqdm(total=estimated_cycles, desc="批量权重共享HBM处理", unit="cycle") as pbar:
+                # 运行流水线，直到处理完所有输入并且没有更多有效数据
                 
-                # 为每个trapezoid准备当前周期的输入
-                cycle_results = []
-                
-                for trap_idx, trapezoid in enumerate(trapezoid_list):
-                    # 确定当前trapezoid属于哪个batch组
-                    batch_group = trap_idx // pe_row_per_batch
-                    # 当前trapezoid在其batch组内的局部索引
-                    local_trap_idx = trap_idx % pe_row_per_batch
+                while (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)) and (cycle < max_cycles or max_cycles == -1):
                     
-                    # 计算当前trapezoid应该处理的B_data索引
-                    # 在每个batch组内采用轮询分配策略
-                    current_b_data_idx = input_idx + local_trap_idx
+                    for trap_idx, trapezoid in enumerate(trapezoid_list):
+                        # 确定当前trapezoid属于哪个batch组
+                        batch_group = trap_idx // pe_row_per_batch + round_idx * pe_row
+                        # 当前trapezoid在其batch组内的局部索引
+                        local_trap_idx = trap_idx % pe_row_per_batch
+                        
+                        # 计算当前trapezoid应该处理的B_data索引
+                        # 在每个batch组内采用轮询分配策略
+                        current_b_data_idx = input_idx + local_trap_idx
+                        
+                        if current_b_data_idx < len(B_data_list):
+                            # 获取对应batch的A矩阵
+                            A = A_batch_matrices[batch_group]
+
+                            # 从B数据列表获取当前B的CSR格式数据（所有batch共享）
+                            B_data = B_data_list[current_b_data_idx]
+                            values_B = B_data.get("values", [])
+                            col_indices = B_data.get("col_indices", [])
+                            row_ptr = B_data.get("row_ptr", [])
+                            start_index = B_data.get("row_start_index", 0)
+
+                            valid = True
+                        else:
+                            # 没有更多输入给这个trapezoid
+                            A = np.array([[]])
+                            values_B = []
+                            col_indices = []
+                            row_ptr = []
+                            start_index = 0
+                            valid = False
+
+                        # 运行当前trapezoid的一个时钟周期
+                        result = trapezoid.clock_cycle(
+                            valid=valid, 
+                            A=A, 
+                            B=np.array([]),  # 在HBM模式下B矩阵为空
+                            is_hbm=True, 
+                            start_index=start_index,
+                            values_B_input=values_B, 
+                            col_indices_input=col_indices, 
+                            row_ptr_input=row_ptr
+                        )
+                        
                     
-                    if current_b_data_idx < len(B_data_list):
-                        # 获取对应batch的A矩阵
-                        A = A_batch_matrices[batch_group]
+                    # 更新输入索引（每个周期前进pe_row_per_batch个步长）
+                    if input_idx < len(B_data_list):
+                        input_idx += pe_row_per_batch
+                    
 
-                        # 从B数据列表获取当前B的CSR格式数据（所有batch共享）
-                        B_data = B_data_list[current_b_data_idx]
-                        values_B = B_data.get("values", [])
-                        col_indices = B_data.get("col_indices", [])
-                        row_ptr = B_data.get("row_ptr", [])
-                        start_index = B_data.get("row_start_index", 0)
-
-                        valid = True
+                    # 更新进度条
+                    cycle += 1
+                    
+                    # 动态更新进度条描述
+                    active_traps = sum(1 for trap in trapezoid_list if trap.is_active())
+                    if input_idx < len(B_data_list):
+                        pbar.set_description(f"批量处理 (数据 {input_idx//pe_row_per_batch}/{len(B_data_list)//pe_row_per_batch}, 活跃:{active_traps})")
                     else:
-                        # 没有更多输入给这个trapezoid
-                        A = np.array([[]])
-                        values_B = []
-                        col_indices = []
-                        row_ptr = []
-                        start_index = 0
-                        valid = False
-
-                    # 运行当前trapezoid的一个时钟周期
-                    result = trapezoid.clock_cycle(
-                        valid=valid, 
-                        A=A, 
-                        B=np.array([]),  # 在HBM模式下B矩阵为空
-                        is_hbm=True, 
-                        start_index=start_index,
-                        values_B_input=values_B, 
-                        col_indices_input=col_indices, 
-                        row_ptr_input=row_ptr
-                    )
+                        pbar.set_description(f"批量处理 (排空中, 活跃:{active_traps})")
                     
-                    # 添加trapezoid和batch标识
-                    result["trapezoid_id"] = trap_idx
-                    result["batch_group"] = batch_group
-                    result["local_trap_idx"] = local_trap_idx
-                    cycle_results.append(result)
-                
-                # 更新输入索引（每个周期前进pe_row_per_batch个步长）
-                if input_idx < len(B_data_list):
-                    input_idx += pe_row_per_batch
-                
-                all_results.append(cycle_results)
+                    # 如果超出估算周期数，扩展进度条
+                    if cycle >= pbar.total:
+                        pbar.total = cycle + 10
+                        pbar.refresh()
+                    
+                    pbar.update(1)
 
-                # 更新进度条
-                cycle += 1
-                
-                # 动态更新进度条描述
-                active_traps = sum(1 for trap in trapezoid_list if trap.is_active())
-                if input_idx < len(B_data_list):
-                    pbar.set_description(f"批量处理 (数据 {input_idx//pe_row_per_batch}/{len(B_data_list)//pe_row_per_batch}, 活跃:{active_traps})")
-                else:
-                    pbar.set_description(f"批量处理 (排空中, 活跃:{active_traps})")
-                
-                # 如果超出估算周期数，扩展进度条
-                if cycle >= pbar.total:
-                    pbar.total = cycle + 10
-                    pbar.refresh()
-                
-                pbar.update(1)
 
-                # 如果需要，打印当前状态
-                if print_states and (cycle % 10 == 0 or cycle < 5):
-                    pbar.write(f"\n--- 周期 {cycle} (批量权重共享HBM模式) ---")
-                    for i, trap in enumerate(trapezoid_list):
-                        batch_group = i // pe_row_per_batch
-                        local_idx = i % pe_row_per_batch
-                        state = trap.get_pipeline_state()
-                        pbar.write(f"  Trap {i} (batch{batch_group}-{local_idx}): 周期{state['cycle_count']}, "
-                                f"活跃{'是' if trap.is_active() else '否'}, "
-                                f"非零结果{state['result']['c_values_non_zero']}")
+            # 检查是否因为达到最大周期数而退出
+            if cycle >= max_cycles and (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)):
+                print(f"警告: 达到最大周期数 {max_cycles}，流水线可能未完全排空")
 
-        # 检查是否因为达到最大周期数而退出
-        if cycle >= max_cycles and (input_idx < len(B_data_list) or any(trap.is_active() for trap in trapezoid_list)):
-            print(f"警告: 达到最大周期数 {max_cycles}，流水线可能未完全排空")
-
-        # 收集每个batch的最终结果
-        # 按batch组收集trapezoid的结果
-        for trap_idx, trapezoid in enumerate(trapezoid_list):
-            batch_group = trap_idx // pe_row_per_batch
-            
-            # 将当前trapezoid的结果累加到对应batch的结果中
-            if batch_group < batch:  # 确保batch_group有效
-                batch_c_values[batch_group] = bf16_add_list(
-                    batch_c_values[batch_group], 
-                    trapezoid.c_values
+            # 收集每个batch的最终结果
+            # 按batch组收集trapezoid的结果
+            for trap_idx, trapezoid in enumerate(trapezoid_list):
+                batch_group = trap_idx // pe_row_per_batch + round_idx * pe_row
+                
+                # 将当前trapezoid的结果累加到对应batch的结果中
+                if batch_group < batch:  # 确保batch_group有效
+                    batch_c_values[batch_group] = bf16_add_list(
+                        batch_c_values[batch_group], 
+                        trapezoid.c_values
                 )
+            for trapezoid in trapezoid_list:
+                trapezoid.reset()
+            
 
         # 构建最终的输出矩阵，shape为(batch, M, N)
         M, N = trapezoid_list[0].M, trapezoid_list[0].N
         combined_c_matrix = np.zeros((batch, M, N))
         combined_c_matrix_bf16 = np.zeros((batch, M, N))
 
-        batch_results = {}
         for batch_idx in range(batch):
             # 转换BF16结果为浮点数
             c_matrix = np.array([bf16_to_float(v) for v in batch_c_values[batch_idx]]).reshape(M, N)
@@ -1220,20 +1205,12 @@ class TrapezoidPipeline:
             combined_c_matrix[batch_idx] = c_matrix
             combined_c_matrix_bf16[batch_idx] = c_matrix_bf16
             
-            # 单独的batch结果
-            batch_results[f"batch_{batch_idx}"] = {
-                "c_matrix": c_matrix,
-                "c_values_bf16": batch_c_values[batch_idx].copy(),
-                "batch_idx": batch_idx
-            }
 
         print(f"✅ 批量权重共享HBM处理完成，总共 {cycle} 个周期")
         print(f"📊 生成了 {batch} 个batch的结果，每个结果形状为 ({M}, {N})")
 
         return {
-            "all_cycle_results": all_results,
             "cycles": cycle,
-            "individual_batch_results": batch_results,
             "combined_c_matrix": combined_c_matrix,  # shape: (batch, M, N)
             "combined_c_matrix_bf16": combined_c_matrix_bf16,  # shape: (batch, M, N)
             "num_trapezoids": num_trapezoids,
