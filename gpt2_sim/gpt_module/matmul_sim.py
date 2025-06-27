@@ -60,6 +60,7 @@ class Matmul:
             result = main_trap.run_pipeline_hbm_multi([A], self.hbm_data, self.trapezoid_rows, -1)
         if test:
             return result["combined_c_matrix"]
+        self.cycles = result["cycles"]
         return result["combined_c_matrix_bf16"]
         
     

@@ -29,6 +29,7 @@ class Block_Sim:
         self.ln_2 = LayerNorm_Sim(PE_num, PE_rows, data_num_per_cycle)
         self.ffn = FFN(PE_num, PE_rows, data_num_per_cycle)
         self.res_2 = Residual_Sim2(PE_num, PE_rows, data_num_per_cycle)
+        self.cycles = 0
 
     def load_attention_weights(self, wq, wk, xt, wv):
         """加载注意力所需权重"""
@@ -64,25 +65,30 @@ class Block_Sim:
         """
         # 1. 第一个LayerNorm
         norm1_out_bf16 = self.ln_1.forward(x_bf16)
+        self.cycles += self.ln_1.cycles
         
         # 2. Attention
         _, attn_out, _ = self.attn.forward(norm1_out_bf16, past_token_num)
+        self.cycles += self.attn.cycles
         # print(f"hw attn_out输出示例:\n{attn_out[0, :10]}")
         # 转 bf16 供 FFN
         attn_out_bf16 = convert_matrix_to_bf16(attn_out)
         
         # 3. 第一个残差连接
         residual1_out = self.res_1.forward(attn_out_bf16,x_bf16)
+        self.cycles += self.res_1.cycles
         # print(f"hw res1_out输出示例:\n{residual1_out[0, :10]}")
         
         # 4. 第二个LayerNorm
         norm2_out = self.ln_2.forward(residual1_out)
-        
+        self.cycles += self.ln_2.cycles
         # 5. FFN
         ffn_out = self.ffn.forward(norm2_out)
+        self.cycles += self.ffn.cycles
         
         # 6. 第二个残差连接
         final_out = self.res_2.forward(ffn_out,residual1_out)
+        self.cycles += self.res_2.cycles
 
         
         return final_out
@@ -159,6 +165,8 @@ class Block_Sim:
             print("❌ 验证失败: 硬件模拟结果与Numpy实现不匹配")
             print(f"Numpy输出示例:\n{torch_out[0, :10]}")
             print(f"硬件模拟输出示例:\n{hw_out_fp32[0, :10]}")
+
+        print(f"硬件模拟周期数: {self.cycles}")
         
         return is_correct
 
@@ -167,7 +175,7 @@ def generate_matrix(M, N, sparse_ratio):
 
 def generate_x_wq_wk_xt(past_token_length, channel, sparse_ratio):
     
-    x = generate_matrix(1, channel, 0.4)
+    x = generate_matrix(1, channel, 0)
     wq = generate_matrix(channel, channel, sparse_ratio)
     wk = generate_matrix(channel, channel, sparse_ratio)
     xt = generate_matrix(past_token_length + 1, channel, sparse_ratio)
@@ -188,17 +196,17 @@ def convert_matrix_to_bf16(A):
 
 def test_block():
     """测试Block模拟器"""
-    vector_size = 256
+    vector_size = 1024
     hidden_dim = 4 * vector_size
     past_token_num = 255
     
     # 创建Block模拟器
     block = Block_Sim(128, 32, 256)
 
-    X, wq, wk, xt = generate_x_wq_wk_xt(past_token_length=255, channel=vector_size, sparse_ratio=0.95)
+    X, wq, wk, xt = generate_x_wq_wk_xt(past_token_length=255, channel=vector_size, sparse_ratio=0)
     past_token_num = xt.shape[0]
 
-    wv = generate_matrix(past_token_num , vector_size, 0.9)
+    wv = generate_matrix(past_token_num , vector_size, 0)
     
     x_bf16 = convert_matrix_to_bf16(X)
     # 生成LayerNorm权重和偏置
@@ -210,8 +218,8 @@ def test_block():
 
     
     # 生成FFN权重
-    w1 = generate_matrix(vector_size, hidden_dim, 0.95)  # 全稠密
-    w2 = generate_matrix(hidden_dim, vector_size, 0.95)
+    w1 = generate_matrix(vector_size, hidden_dim, 0)  # 全稠密
+    w2 = generate_matrix(hidden_dim, vector_size, 0)
     
     # 验证结果
     block.verify_result(x_bf16, ln1_weight, ln1_bias, ln2_weight, ln2_bias,

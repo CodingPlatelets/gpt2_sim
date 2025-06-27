@@ -17,6 +17,7 @@ class FFN:
         # 记录权重形状，便于 forward 中确定列数
         self._hidden_dim = None  # W1 列数 / W2 行数
         self._out_dim = None     # W2 列数
+        self.cycles = 0
 
     def load_weights(self, w1: np.ndarray, w2: np.ndarray):
         """加载两层权重到 HBM，并记录维度。w1.shape=(K, H), w2.shape=(H, D)"""
@@ -42,10 +43,12 @@ class FFN:
         # k_dim = x_bf16.shape[1]
         h_dim = self._hidden_dim
         out1_bf16 = self.W1.forward(x_bf16, M, k_dim, h_dim, test=False)
+        self.cycles += self.W1.cycles
 
         # ------- 第二层 -------
         d_dim = self._out_dim
         out2 = self.W2.forward(out1_bf16, M, h_dim, d_dim, test=False)
+        self.cycles += self.W2.cycles
         return out2
 
 # ======================= 单元测试 =======================

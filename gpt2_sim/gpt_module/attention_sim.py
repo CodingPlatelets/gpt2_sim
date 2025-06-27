@@ -58,13 +58,17 @@ class Attention:
         # 3) ((XWq)Wk^T) @ XT^T
         xwwx = self.XT.forward(xww, M, k_dim, past_token_num, test=True)
 
+        self.cycles += self.Wq.cycles + self.Wk.cycles + self.XT.cycles
+
         # 4) softmax - 使用硬件流水线模拟版本
         softmax_out, softmax_sim_info = self._run_softmax_pipeline(xwwx)
 
         if x.ndim == 3:
             xwwxt = self.Wv_multi_batch.forward(softmax_out)
+            self.cycles += self.Wv_multi_batch.cycles
         else:
             xwwxt = self.Wv.forward(softmax_out)
+            self.cycles += self.Wv.cycles
          
         # 累计周期数（包含 softmax 的周期）
         self.cycles += softmax_sim_info.get('total_cycles', 0)

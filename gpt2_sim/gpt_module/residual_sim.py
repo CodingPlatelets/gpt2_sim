@@ -99,6 +99,7 @@ class Residual_Sim2:
         """
         # 初始化各个硬件模拟器
         self.row_add_res = RowAdd2MultiBatch(PE_num, PE_rows, data_num_per_cycle)
+        self.cycles = 0
         
     def forward(self, x_bf16,residual_bf16):
         """
@@ -112,6 +113,7 @@ class Residual_Sim2:
         """
         # 1. 残差连接
         residual_out = self.row_add_res.forward(x_bf16,residual_bf16)
+        self.cycles = self.row_add_res.cycles
 
         return residual_out
     

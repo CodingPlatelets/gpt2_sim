@@ -65,6 +65,7 @@ class RowProduct:
 
         # 运行模拟
         sim_res = self.simulator.run_simulation(X, self.hbm_data, self.data_num_per_cycle)
+        self.cycles = sim_res["clock"]
 
         # 根据原始输入格式返回相应的输出
         if return_1d:

@@ -35,6 +35,7 @@ class RowProduct:
         self.simulator.vector_size = self.hbm_data.shape[1]
 
         sim_res = self.simulator.run_simulation(X, self.hbm_data, self.data_num_per_cycle)
+        self.cycles = sim_res["clock"]
 
         # 可选：验证结果正确性（调试阶段保留）
         # self.simulator.verify_result(X, self.hbm_data)

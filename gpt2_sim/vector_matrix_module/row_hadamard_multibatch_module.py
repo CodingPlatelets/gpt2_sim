@@ -45,6 +45,7 @@ class RowHadamardMultiBatch:
             raise ValueError(f"HBM向量batch数 {hbm.shape[0]} 与输入batch数 {batch_size} 不一致")
         self.simulator.vector_size = hbm.shape[1]
         sim_res = self.simulator.run_simulation(X, hbm, self.data_num_per_cycle)
+        self.cycles = sim_res["clock"]
         hadamard_out = np.uint16(sim_res["output_matrix"])
         self.simulator.verify_result(X, hbm)
         if return_1d:

@@ -212,6 +212,7 @@ class LayerNorm_Sim:
         self.row_add_bais = RowAddMultiBatch(PE_num, PE_rows, data_num_per_cycle)
         # self.norm_core = LayerNormCoreSW()
         self.norm_core = LayerNormCoreHW()
+        self.cycles = 0
         
     def load_ln_weights(self, ln_weight, ln_bias):
         self.row_hadamard.load_from_hbm(ln_weight)
@@ -231,14 +232,16 @@ class LayerNorm_Sim:
         
         # 1. LayerNorm核心计算
         norm_out = self.norm_core.forward(x)
+        self.cycles += self.norm_core.cycles
         
         # 2. 应用权重（Hadamard积）
         weighted_out = self.row_hadamard.forward(norm_out)
+        self.cycles += self.row_hadamard.cycles
         print(f"结果矩阵样本:\n{weighted_out[:3, :10]}")
         
         # 3. 应用偏置（加法）
         final_out = self.row_add_bais.forward(weighted_out)
-
+        self.cycles += self.row_add_bais.cycles
         
         return final_out
 
