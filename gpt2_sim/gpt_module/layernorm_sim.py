@@ -36,9 +36,14 @@ class LayerNormCoreHW:
         self.var_cycles = 0
         self.norm_cycles = 0
         
+        #print(f"x_bf16.shape: {x_bf16.shape}")
+
         # 确保输入是2D数组
         if x_bf16.ndim == 1:
             x_bf16 = x_bf16.reshape(1, -1)
+
+        if x_bf16.ndim == 3:
+            x_bf16 = x_bf16.squeeze(1)
             
         # 转换为FP32进行计算
         x_fp32 = np.vectorize(bf16_to_float)(x_bf16)

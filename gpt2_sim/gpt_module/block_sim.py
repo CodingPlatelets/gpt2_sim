@@ -35,8 +35,14 @@ class Block_Sim:
         """加载注意力所需权重"""
         self.attn.Wq.load_from_hbm(wq)
         self.attn.Wk.load_from_hbm(wk.T)
-        self.attn.XT.load_from_hbm(xt.T)
-        self.attn.Wv.load_from_hbm(wv)
+        if xt.ndim == 2:
+            self.attn.XT.load_from_hbm(xt.T)
+        else:
+            self.attn.XT.load_from_hbm_batch(xt.transpose(0, 2, 1))
+        if xt.ndim == 2:
+            self.attn.Wv.load_from_hbm(wv)
+        else:
+            self.attn.Wv_multi_batch.load_from_hbm(wv)
 
     def load_ffn_weights(self, w1, w2):
         self.ffn.load_weights(w1, w2)
@@ -66,15 +72,25 @@ class Block_Sim:
         # 1. 第一个LayerNorm
         norm1_out_bf16 = self.ln_1.forward(x_bf16)
         self.cycles += self.ln_1.cycles
+
+        #print(f"norm1_out_bf16.shape: {norm1_out_bf16.shape}")
+        if norm1_out_bf16.shape[0] != 1:
+            norm1_out_bf16 = np.expand_dims(norm1_out_bf16, axis=1)
         
         # 2. Attention
         _, attn_out, _ = self.attn.forward(norm1_out_bf16, past_token_num)
         self.cycles += self.attn.cycles
         # print(f"hw attn_out输出示例:\n{attn_out[0, :10]}")
         # 转 bf16 供 FFN
-        attn_out_bf16 = convert_matrix_to_bf16(attn_out)
+        #print(f"attn_out.shape: {attn_out.shape}")
         
+        attn_out_bf16 = convert_matrix_to_bf16(attn_out)
+        #print(f"attn_out_bf16.shape: {attn_out_bf16.shape}")
+        #if attn_out_bf16.shape[0] != 1:
+        #    attn_out_bf16 = np.expand_dims(attn_out_bf16, axis=1)
         # 3. 第一个残差连接
+        if x_bf16.ndim == 3:
+            x_bf16 = x_bf16.squeeze(1)
         residual1_out = self.res_1.forward(attn_out_bf16,x_bf16)
         self.cycles += self.res_1.cycles
         # print(f"hw res1_out输出示例:\n{residual1_out[0, :10]}")
@@ -87,6 +103,9 @@ class Block_Sim:
         self.cycles += self.ffn.cycles
         
         # 6. 第二个残差连接
+        if ffn_out.ndim == 3:
+            ffn_out = ffn_out.squeeze(1)
+        ffn_out = convert_matrix_to_bf16(ffn_out)
         final_out = self.res_2.forward(ffn_out,residual1_out)
         self.cycles += self.res_2.cycles
 
@@ -128,13 +147,21 @@ class Block_Sim:
         # 2. Attention
         xw = norm1_out @ wq
         xww = xw @ wk.T
-        xwwx = xww @ xt.T
+        if xt.ndim == 2:
+            xwwx = xww @ xt.T
+        else:
+            xwwx = xww @ xt.transpose(0, 2, 1)
+            xwwx = xwwx.squeeze(1)
 
         attn_out = Softmax().forward(xwwx)@wv
         attn_out_bf16 = convert_matrix_to_bf16(attn_out)
         # print(f"np attn_out输出示例:\n{attn_out[0, :10]}")
         attn_out = np.vectorize(bf16_to_float)(attn_out_bf16)
         
+        print(f"x_fp32.shape: {x_fp32.shape}")
+        print(f"attn_out.shape: {attn_out.shape}")
+        if x_fp32.ndim == 3:
+            x_fp32 = x_fp32.squeeze(1)
         # 3. 第一个残差连接
         residual1_out = x_fp32 + attn_out
         # print(f"np res1_out输出示例:\n{residual1_out[0, :10]}")
@@ -143,9 +170,14 @@ class Block_Sim:
         norm2_out = LayerNormCoreVerify().forward(residual1_out)
         # 5. FFN
         ffn_out = norm2_out @ w1 @ w2
+
+        print(f"ffn_out.shape: {ffn_out.shape}")
+        print(f"residual1_out.shape: {residual1_out.shape}")
+
         ffn_out_bf16 = convert_matrix_to_bf16(ffn_out)
         # print(f"np ffn_out输出示例:\n{ffn_out[0, :10]}")
         ffn_out = np.vectorize(bf16_to_float)(ffn_out_bf16)
+        
         # 6. 第二个残差连接
         torch_out = residual1_out + ffn_out
 
@@ -224,6 +256,42 @@ def test_block():
     # 验证结果
     block.verify_result(x_bf16, ln1_weight, ln1_bias, ln2_weight, ln2_bias,
                        wq, wk, xt, wv, w1, w2, past_token_num)
+    
+def test_block_batch():
+    """测试Block模拟器"""
+    vector_size = 256
+    hidden_dim = 4 * vector_size
+    past_token_num = 255
+
+    batch_size = 4
+    
+    block = Block_Sim(128, 32, 256)
+
+    from .test_tgx import generate_x_wq_wk_xt_batch, convert_batch_matrix_to_bf16
+
+    X, wq, wk, xt = generate_x_wq_wk_xt_batch(past_token_length=past_token_num, channel=vector_size, sparse_ratio=0, batch=batch_size)
+    past_token_num = xt.shape[1]
+    wv = generate_matrix(past_token_num , vector_size, 0)
+    x_bf16 = convert_batch_matrix_to_bf16(X)
+    ln1_weight = generate_matrix(1, vector_size, 0)
+    ln1_bias = generate_matrix(1, vector_size, 0)
+    ln2_weight = generate_matrix(1, vector_size, 0)
+    ln2_bias = generate_matrix(1, vector_size, 0)
+
+    w1 = generate_matrix(vector_size, hidden_dim, 0)  # 全稠密
+    w2 = generate_matrix(hidden_dim, vector_size, 0)
+
+    block.verify_result(x_bf16, ln1_weight, ln1_bias, ln2_weight, ln2_bias,
+                       wq, wk, xt, wv, w1, w2, past_token_num)
+    
+
+
+
+
+
+    
+    
 
 if __name__ == "__main__":
-    test_block() 
+    #test_block() 
+    test_block_batch()

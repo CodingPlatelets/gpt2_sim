@@ -37,11 +37,17 @@ class FFN:
             k_dim = x_bf16.shape[2]
             M = x_bf16.shape[1]
         else:
-            k_dim = x_bf16.shape[1]
-            M = x_bf16.shape[0]
+            if x_bf16.shape[0] != 1:
+                x_bf16 = np.expand_dims(x_bf16, axis=1)
+                k_dim = x_bf16.shape[2]
+                M = x_bf16.shape[1]
+            else:
+                k_dim = x_bf16.shape[1]
+                M = x_bf16.shape[0]
         
         # k_dim = x_bf16.shape[1]
         h_dim = self._hidden_dim
+        #print(f"x_bf16.shape: {x_bf16.shape}")
         out1_bf16 = self.W1.forward(x_bf16, M, k_dim, h_dim, test=False)
         self.cycles += self.W1.cycles
 
