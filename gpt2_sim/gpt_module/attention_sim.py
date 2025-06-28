@@ -272,8 +272,8 @@ def test():
 
 def test_batch():
     vector_size = 256  # 为了演示，batch测试用较小向量
-    batch_size = 4
-    attention = Attention(128, 32, 256)
+    batch_size = 32
+    attention = Attention(128, 8, 256)
 
     # 生成batch测试数据
     from .test_tgx import generate_x_wq_wk_xt_batch, convert_batch_matrix_to_bf16

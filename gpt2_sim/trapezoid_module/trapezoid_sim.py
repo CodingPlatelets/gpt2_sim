@@ -1073,11 +1073,10 @@ class TrapezoidPipeline:
         pe_row = num_trapezoids
         if batch > pe_row:
             round_num = batch // pe_row
-
-        # 计算每个batch分配的PE行数
-        pe_row_per_batch = pe_row // batch
-        if batch == 64 or batch == 128:
             pe_row_per_batch = 1
+        else:
+            pe_row_per_batch = pe_row // batch
+
         
 
         
