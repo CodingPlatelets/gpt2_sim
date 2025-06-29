@@ -10,99 +10,69 @@ from tqdm import tqdm
 
 # 修复导入路径
 try:
-    from .store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
     from .bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
 except ImportError:
     # 如果相对导入失败，尝试从其他路径导入
     try:
-        from store_csr_in_simple_blocks import store_csr_in_simple_blocks, store_csr_in_simple_blocks_fast
         from bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
     except ImportError:
         # 尝试从hbm模块导入
         try:
-            from ..hbm.csr_hbm_values_base import store_csr_in_simple_blocks_fast
-            store_csr_in_simple_blocks = store_csr_in_simple_blocks_fast  # 别名
             from .bf16_sim import BF16AddPipeline, BF16MultiplyPipeline, FP32toBF16Pipeline
         except ImportError:
-            print("警告: 无法导入依赖模块，将使用简化版本")
-            # 提供简化的实现
-            def store_csr_in_simple_blocks_fast(csr_matrix, elements_per_block=256):
-                """简化的CSR分块函数"""
-                blocks = []
-                values = csr_matrix.data
-                col_indices = csr_matrix.indices
-                row_ptrs = csr_matrix.indptr
-                
-                current_block = {
-                    "values": [],
-                    "col_indices": [],
-                    "row_ptr": [0],
-                    "row_start_index": 0
-                }
-                
-                block_values_count = 0
-                current_row_start = 0
-                
-                for row_idx in range(len(row_ptrs) - 1):
-                    start, end = row_ptrs[row_idx], row_ptrs[row_idx + 1]
-                    row_values = values[start:end]
-                    row_cols = col_indices[start:end]
-                    
-                    if block_values_count + len(row_values) > elements_per_block and current_block["values"]:
-                        # 完成当前块
-                        blocks.append(current_block)
-                        # 开始新块
-                        current_block = {
-                            "values": list(row_values),
-                            "col_indices": list(row_cols),
-                            "row_ptr": [0, len(row_values)],
-                            "row_start_index": row_idx
-                        }
-                        block_values_count = len(row_values)
-                    else:
-                        # 添加到当前块
-                        current_block["values"].extend(row_values)
-                        current_block["col_indices"].extend(row_cols)
-                        current_block["row_ptr"].append(len(current_block["values"]))
-                        block_values_count += len(row_values)
-                        if not current_block["row_start_index"]:
-                            current_block["row_start_index"] = row_idx
-                
-                if current_block["values"]:
-                    blocks.append(current_block)
-                
-                return blocks
-            
-            store_csr_in_simple_blocks = store_csr_in_simple_blocks_fast
-            
-            # 简化的BF16实现
-            class SimpleBF16Pipeline:
-                def __init__(self):
-                    self.outputs = []
-                
-                def clock_cycle(self, a, b, valid):
-                    if valid and a is not None and b is not None:
-                        result = float(a) * float(b) if hasattr(a, '__float__') else a * b
-                        self.outputs.append(result)
-                        return {"valid_output": True}
-                    return {"valid_output": False}
-                
-                def is_active(self):
-                    return False
-                
-                def run_simulation(self, inputs, print_states=False):
-                    for a, b, valid in inputs:
-                        if valid:
-                            self.outputs.append({"bf16": int(a * 65536)})  # 简化的BF16转换
-                    return self.outputs
-            
-            BF16MultiplyPipeline = SimpleBF16Pipeline
-            BF16AddPipeline = SimpleBF16Pipeline
-            FP32toBF16Pipeline = SimpleBF16Pipeline
+            raise ImportError("无法找到bf16_sim模块")
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("VecMatProdSim")
+
+def store_csr_in_simple_blocks_fast(csr_matrix, elements_per_block=2):
+    values = csr_matrix.data
+    col_indices = csr_matrix.indices
+    row_pointers = csr_matrix.indptr
+    num_rows = csr_matrix.shape[0]
+    total_values = len(values)  # 修复：添加缺失的变量
+
+    # 预先生成每个元素的行号
+    row_indices = np.zeros_like(values, dtype=np.int32)
+    for row in range(num_rows):
+        row_indices[row_pointers[row]:row_pointers[row+1]] = row
+
+    num_blocks = (total_values + elements_per_block - 1) // elements_per_block
+    blocks = []
+
+    for block_idx in range(num_blocks):
+        start_idx = block_idx * elements_per_block
+        end_idx = min(start_idx + elements_per_block, total_values)
+
+        block_values = values[start_idx:end_idx].tolist()
+        block_col_indices = col_indices[start_idx:end_idx].tolist()
+        block_row_indices = row_indices[start_idx:end_idx]
+
+        if len(block_row_indices) == 0:
+            continue
+
+        row_start = block_row_indices[0]
+        row_end = block_row_indices[-1]
+        num_block_rows = row_end - row_start + 1
+
+        # 生成块内row_ptr
+        block_row_ptr = [0]
+        cur = 0
+        for r in range(row_start, row_end + 1):
+            # 统计本行在block中的元素数
+            count = np.sum(block_row_indices == r)
+            cur += count
+            block_row_ptr.append(cur)
+
+        block = {
+            "values": block_values,
+            "col_indices": block_col_indices,
+            "row_ptr": block_row_ptr,
+            "row_start_index": int(row_start),
+        }
+        blocks.append(block)
+    return blocks
 
 def direct_bf16_add(a, b):
     """直接计算两个BF16数字的和"""
@@ -331,12 +301,17 @@ class VectorMatrixRowProductSimulatorWithHBM:
         batch_size, vector_dim = A_vectors.shape
         logger.info(f"行积：开始HBM模式多batch模拟. A({batch_size}, {vector_dim}) @ B({B_matrix_sparse.shape})")
         
-        # 计算perows分组策略
-        perows_per_batch = self.num_perows // batch_size
-        if perows_per_batch == 0:
-            raise ValueError(f"batch_size({batch_size}) 不能大于 num_perows({self.num_perows})")
-        
-        logger.info(f"batch_size: {batch_size}, 每个batch分配 {perows_per_batch} 个perows")
+        # 计算perows分组策略 - 支持batch > num_perows的时间复用
+        if batch_size <= self.num_perows:
+            # 情况1: batch <= perows，每个batch分配若干perows
+            perows_per_batch = self.num_perows // batch_size
+            batches_per_perow = 1
+            logger.info(f"batch_size: {batch_size}, 每个batch分配 {perows_per_batch} 个perows")
+        else:
+            # 情况2: batch > perows，每个perow处理多个batch（时间复用）
+            perows_per_batch = 1
+            batches_per_perow = (batch_size + self.num_perows - 1) // self.num_perows  # ceil division
+            logger.info(f"batch_size: {batch_size}, 每个perow处理 {batches_per_perow} 个batch（时间复用）")
         
         self.reset(batch_size)
 
@@ -353,84 +328,124 @@ class VectorMatrixRowProductSimulatorWithHBM:
             A_vectors_bf16.append(A_vector_bf16)
 
         # --- 2. 按块处理 ---
+        # 需要为每个batch处理所有blocks，支持时间复用
+        if batch_size <= self.num_perows:
+            # 情况1: 正常模式，所有batch可以并行处理
+            num_time_slots = 1
+            batches_per_slot = batch_size
+        else:
+            # 情况2: 时间复用模式，分多个时间片处理
+            num_time_slots = batches_per_perow
+            batches_per_slot = self.num_perows
+        
         block_idx = 0
         total_tasks_generated = 0
         cycle = 0
         num_blocks = len(B_blocks)
-        pbar = tqdm(total=num_blocks+100, desc="行积：处理HBM多batch数据", unit="cycle")
+        pbar = tqdm(total=num_blocks * num_time_slots + 100, desc="行积：处理HBM多batch数据", unit="cycle")
         
-        while block_idx < num_blocks or any(perow.is_busy() for perow in self.perows):
-            # 注入新的block数据
-            if block_idx < num_blocks:
-                block = B_blocks[block_idx]
+        # 外层循环：时间片
+        for time_slot in range(num_time_slots):
+            block_idx = 0  # 每个时间片都要处理所有blocks
+            
+            # 确定当前时间片要处理的batch范围
+            start_batch_idx = time_slot * batches_per_slot
+            end_batch_idx = min(start_batch_idx + batches_per_slot, batch_size)
+            current_batches = list(range(start_batch_idx, end_batch_idx))
+            
+            logger.info(f"时间片 {time_slot+1}/{num_time_slots}: 处理batch {current_batches}")
+            
+            # 重置所有PERows（清除上一个时间片的状态）
+            if time_slot > 0:
+                for perow in self.perows:
+                    perow.reset()
+            
+            # 内层循环：处理所有blocks
+            while block_idx < num_blocks or any(perow.is_busy() for perow in self.perows):
+                # 注入新的block数据
+                if block_idx < num_blocks:
+                    block = B_blocks[block_idx]
+                    
+                    # 为当前时间片的每个batch生成任务
+                    for batch_offset, batch_idx in enumerate(current_batches):
+                        batch_tasks = []
+                        b_values_bf16 = [fp32_to_bf16(v) for v in block["values"]]
+                        num_rows_in_block = len(block["row_ptr"]) - 1
+                        
+                        A_vector_bf16 = A_vectors_bf16[batch_idx]
+                        
+                        for r_offset in range(num_rows_in_block):
+                            start, end = block["row_ptr"][r_offset], block["row_ptr"][r_offset+1]
+                            if start == end: 
+                                continue
+                            
+                            # 计算出该行在全局A向量中的真实行号
+                            abs_row_idx = block["row_start_index"] + r_offset
+                            # 取出A向量对应行的元素
+                            a_val = A_vector_bf16[abs_row_idx]
+                            
+                            # 遍历该行在B矩阵中的非零元素
+                            for j in range(start, end):
+                                b_val = b_values_bf16[j]
+                                target_col_idx = block["col_indices"][j]
+                                batch_tasks.append((a_val, b_val, target_col_idx))
+                        
+                        total_tasks_generated += len(batch_tasks)
+                        
+                        # 将当前batch的任务分配给对应的perow
+                        if batch_size <= self.num_perows:
+                            # 情况1: 每个batch分配多个perows
+                            start_perow_idx = batch_offset * perows_per_batch
+                            end_perow_idx = min(start_perow_idx + perows_per_batch, self.num_perows)
+                            batch_perow_count = end_perow_idx - start_perow_idx
+                        else:
+                            # 情况2: 每个perow处理一个batch
+                            start_perow_idx = batch_offset
+                            end_perow_idx = batch_offset + 1
+                            batch_perow_count = 1
+                        
+                        # 在该batch对应的perows间均匀分配任务
+                        if batch_perow_count > 0 and len(batch_tasks) > 0:
+                            tasks_per_perow = len(batch_tasks) // batch_perow_count
+                            extra_tasks = len(batch_tasks) % batch_perow_count
+                            task_idx = 0
+                            
+                            for perow_offset in range(batch_perow_count):
+                                perow_idx = start_perow_idx + perow_offset
+                                num_tasks_for_this_perow = tasks_per_perow + (1 if perow_offset < extra_tasks else 0)
+                                if num_tasks_for_this_perow > 0:
+                                    tasks_to_assign = batch_tasks[task_idx : task_idx + num_tasks_for_this_perow]
+                                    self.perows[perow_idx].assign_tasks(tasks_to_assign)
+                                    task_idx += num_tasks_for_this_perow
+                    
+                    block_idx += 1
                 
-                # 为每个batch生成任务
-                for batch_idx in range(batch_size):
-                    batch_tasks = []
-                    b_values_bf16 = [fp32_to_bf16(v) for v in block["values"]]
-                    num_rows_in_block = len(block["row_ptr"]) - 1
-                    
-                    A_vector_bf16 = A_vectors_bf16[batch_idx]
-                    
-                    for r_offset in range(num_rows_in_block):
-                        start, end = block["row_ptr"][r_offset], block["row_ptr"][r_offset+1]
-                        if start == end: 
-                            continue
-                        
-                        # 计算出该行在全局A向量中的真实行号
-                        abs_row_idx = block["row_start_index"] + r_offset
-                        # 取出A向量对应行的元素
-                        a_val = A_vector_bf16[abs_row_idx]
-                        
-                        # 遍历该行在B矩阵中的非零元素
-                        for j in range(start, end):
-                            b_val = b_values_bf16[j]
-                            target_col_idx = block["col_indices"][j]
-                            batch_tasks.append((a_val, b_val, target_col_idx))
-                    
-                    total_tasks_generated += len(batch_tasks)
-                    
-                    # 将当前batch的任务分配给对应的perow组
-                    start_perow_idx = batch_idx * perows_per_batch
+                # 推进所有perow流水线
+                for perow in self.perows:
+                    perow.clock_cycle()
+                cycle += 1
+                pbar.update(1)
+            
+            # 当前时间片处理完毕，收集结果
+            logger.info(f"时间片 {time_slot+1} 处理完毕，收集结果...")
+            for batch_offset, batch_idx in enumerate(current_batches):
+                if batch_size <= self.num_perows:
+                    # 情况1: 每个batch分配多个perows，需要累加
+                    start_perow_idx = batch_offset * perows_per_batch
                     end_perow_idx = min(start_perow_idx + perows_per_batch, self.num_perows)
                     
-                    # 在该batch对应的perows间均匀分配任务
-                    batch_perow_count = end_perow_idx - start_perow_idx
-                    if batch_perow_count > 0 and len(batch_tasks) > 0:
-                        tasks_per_perow = len(batch_tasks) // batch_perow_count
-                        extra_tasks = len(batch_tasks) % batch_perow_count
-                        task_idx = 0
-                        
-                        for perow_offset in range(batch_perow_count):
-                            perow_idx = start_perow_idx + perow_offset
-                            num_tasks_for_this_perow = tasks_per_perow + (1 if perow_offset < extra_tasks else 0)
-                            if num_tasks_for_this_perow > 0:
-                                tasks_to_assign = batch_tasks[task_idx : task_idx + num_tasks_for_this_perow]
-                                self.perows[perow_idx].assign_tasks(tasks_to_assign)
-                                task_idx += num_tasks_for_this_perow
-                
-                block_idx += 1
+                    for perow_idx in range(start_perow_idx, end_perow_idx):
+                        perow_result = self.perows[perow_idx].get_result_vector()
+                        for col_idx in range(self.vector_size):
+                            self.final_result_matrix[batch_idx, col_idx] += bf16_to_float(perow_result[col_idx])
+                else:
+                    # 情况2: 每个perow处理一个batch，直接复制
+                    perow_idx = batch_offset
+                    perow_result = self.perows[perow_idx].get_result_vector()
+                    for col_idx in range(self.vector_size):
+                        self.final_result_matrix[batch_idx, col_idx] += bf16_to_float(perow_result[col_idx])
             
-            # 推进所有perow流水线
-            for perow in self.perows:
-                perow.clock_cycle()
-            cycle += 1
-            pbar.update(1)
-        
-        pbar.close()
-        
-        # --- 3. 按batch分组累加最终结果 ---
-        logger.info(f"所有块处理完毕，开始按batch分组累加最终结果...")
-        
-        for batch_idx in range(batch_size):
-            start_perow_idx = batch_idx * perows_per_batch
-            end_perow_idx = min(start_perow_idx + perows_per_batch, self.num_perows)
-            
-            # 累加该batch对应的所有perows的结果
-            for perow_idx in range(start_perow_idx, end_perow_idx):
-                perow_result = self.perows[perow_idx].get_result_vector()
-                for col_idx in range(self.vector_size):
-                    self.final_result_matrix[batch_idx, col_idx] += bf16_to_float(perow_result[col_idx])
+                pbar.close()
         
         logger.info(f"多batch模拟完成. 总周期: {cycle}, 总任务数: {total_tasks_generated}")
         
@@ -485,22 +500,20 @@ def main():
     test_cases = [
         # {"batch_size": 1, "desc": "单batch测试"},
         # {"batch_size": 4, "desc": "4-batch测试 (每8个perow处理1个batch)"},
-        {"batch_size": 8, "desc": "8-batch测试 (每4个perow处理1个batch)"},
-        {"batch_size": 32, "desc": "32-batch测试 (每1个perow处理1个batch)"},
+        # {"batch_size": 8, "desc": "8-batch测试 (每4个perow处理1个batch)"},
+        # {"batch_size": 32, "desc": "32-batch测试 (每1个perow处理1个batch)"},
+        {"batch_size": 64, "desc": "64-batch测试 (时间复用，每个perow处理2个batch)"},
     ]
     
     for test_case in test_cases:
         batch_size = test_case["batch_size"]
         desc = test_case["desc"]
         
-        if batch_size > num_perows:
-            logger.warning(f"跳过测试: {desc} - batch_size({batch_size}) > num_perows({num_perows})")
-            continue
             
         logger.info(f"\n--- {desc} ---")
         
         # --- 数据生成 ---
-        vec_row = 1024
+        vec_row = min(1024, vec_dim)  # 确保不超过设定的维度
         A_vectors = np.random.randn(batch_size, vec_row).astype(np.float32) * 0.1
         
         B_dense = torch.randn((vec_row, output_dim)) * 0.01

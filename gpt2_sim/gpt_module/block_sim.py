@@ -228,30 +228,32 @@ def convert_matrix_to_bf16(A):
 
 def test_block():
     """测试Block模拟器"""
-    vector_size = 1024
+    vector_size = 4096
     hidden_dim = 4 * vector_size
-    past_token_num = 255
+    past_token_num = 512
+    print("正在使用稀疏度为0.9的权重")
+
+    sparse_ratio = 0.9
     
     # 创建Block模拟器
-    block = Block_Sim(128, 32, 256)
+    block = Block_Sim(128, 8, 256)
 
-    X, wq, wk, xt = generate_x_wq_wk_xt(past_token_length=255, channel=vector_size, sparse_ratio=0)
+    X, wq, wk, xt = generate_x_wq_wk_xt(past_token_length=512, channel=vector_size, sparse_ratio=sparse_ratio)
     past_token_num = xt.shape[0]
 
-    wv = generate_matrix(past_token_num , vector_size, 0)
+    wv = generate_matrix(past_token_num , vector_size, sparse_ratio)
     
     x_bf16 = convert_matrix_to_bf16(X)
     # 生成LayerNorm权重和偏置
 
-    ln1_weight = generate_matrix(1, vector_size, 0)
-    ln1_bias = generate_matrix(1, vector_size, 0)
-    ln2_weight = generate_matrix(1, vector_size, 0)
-    ln2_bias = generate_matrix(1, vector_size, 0)
-
+    ln1_weight = generate_matrix(1, vector_size, sparse_ratio)
+    ln1_bias = generate_matrix(1, vector_size, sparse_ratio)
+    ln2_weight = generate_matrix(1, vector_size, sparse_ratio)
+    ln2_bias = generate_matrix(1, vector_size, sparse_ratio)
     
     # 生成FFN权重
-    w1 = generate_matrix(vector_size, hidden_dim, 0)  # 全稠密
-    w2 = generate_matrix(hidden_dim, vector_size, 0)
+    w1 = generate_matrix(vector_size, hidden_dim, sparse_ratio)  # 全稠密
+    w2 = generate_matrix(hidden_dim, vector_size, sparse_ratio)
     
     # 验证结果
     block.verify_result(x_bf16, ln1_weight, ln1_bias, ln2_weight, ln2_bias,
@@ -259,27 +261,30 @@ def test_block():
     
 def test_block_batch():
     """测试Block模拟器"""
-    vector_size = 256
+    print("正在使用稀疏度为0.9的权重,batch_size为4")
+    vector_size = 4096
     hidden_dim = 4 * vector_size
-    past_token_num = 255
+    past_token_num = 512
+
+    sparse_ratio = 0.9
 
     batch_size = 4
     
-    block = Block_Sim(128, 32, 256)
+    block = Block_Sim(128, 8, 256)
 
     from .test_tgx import generate_x_wq_wk_xt_batch, convert_batch_matrix_to_bf16
 
-    X, wq, wk, xt = generate_x_wq_wk_xt_batch(past_token_length=past_token_num, channel=vector_size, sparse_ratio=0, batch=batch_size)
+    X, wq, wk, xt = generate_x_wq_wk_xt_batch(past_token_length=past_token_num, channel=vector_size, sparse_ratio=sparse_ratio, batch=batch_size)
     past_token_num = xt.shape[1]
-    wv = generate_matrix(past_token_num , vector_size, 0)
+    wv = generate_matrix(past_token_num , vector_size, sparse_ratio)
     x_bf16 = convert_batch_matrix_to_bf16(X)
     ln1_weight = generate_matrix(1, vector_size, 0)
     ln1_bias = generate_matrix(1, vector_size, 0)
     ln2_weight = generate_matrix(1, vector_size, 0)
     ln2_bias = generate_matrix(1, vector_size, 0)
 
-    w1 = generate_matrix(vector_size, hidden_dim, 0)  # 全稠密
-    w2 = generate_matrix(hidden_dim, vector_size, 0)
+    w1 = generate_matrix(vector_size, hidden_dim, sparse_ratio)  # 全稠密
+    w2 = generate_matrix(hidden_dim, vector_size, sparse_ratio)
 
     block.verify_result(x_bf16, ln1_weight, ln1_bias, ln2_weight, ln2_bias,
                        wq, wk, xt, wv, w1, w2, past_token_num)
@@ -293,5 +298,5 @@ def test_block_batch():
     
 
 if __name__ == "__main__":
-    #test_block() 
+    # test_block() 
     test_block_batch()
