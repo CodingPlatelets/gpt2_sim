@@ -1,1 +1,0 @@
-from .trapezoid_sim import TrapezoidPipeline
