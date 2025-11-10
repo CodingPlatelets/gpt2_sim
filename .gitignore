@@ -68,3 +68,5 @@ output/
 results/
 configs/*.json
 !configs/default_config.json
+
+tcd-llama-*
